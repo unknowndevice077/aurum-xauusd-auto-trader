@@ -1,0 +1,22 @@
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500&display=swap');
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+.spin {
+  animation: aurum-spin 1s linear infinite;
+}
+
+@keyframes aurum-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.aurum-input::placeholder {
+  color: #6b6d73;
+}
