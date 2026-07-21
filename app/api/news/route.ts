@@ -1,4 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
+
+// ─── Input Validation Schema ──────────────────────────────────────────────
+const NewsRequestSchema = z.object({
+  providerKey: z.enum(['anthropic', 'openai', 'xai']).default('openai'),
+  model: z.string().max(100).optional(),
+  apiKey: z.string().max(500).optional(),
+});
+
+// ─── Rate Limiting (in-memory, per-deployment) ────────────────────────────
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX = 10; // max 10 requests per window per IP
+
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(ip: string): { allowed: boolean; retryAfter?: number } {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { allowed: true };
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX) {
+    return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
+  }
+
+  entry.count++;
+  return { allowed: true };
+}
 
 // Server-side provider registry. Keys come from environment variables by
 // default (set these in Vercel's Project Settings -> Environment Variables,
@@ -15,9 +46,9 @@ const PROVIDERS: Record<
     buildRequest: (args: { apiKey: string; model: string; system: string; userText: string }) => {
       url: string;
       headers: Record<string, string>;
-      body: any;
+      body: unknown;
     };
-    extractText: (data: any) => string;
+    extractText: (data: unknown) => string;
   }
 > = {
   anthropic: {
@@ -41,8 +72,11 @@ const PROVIDERS: Record<
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       },
     }),
-    extractText: (data) =>
-      (data.content || []).map((b: any) => (b.type === 'text' ? b.text : '')).filter(Boolean).join('\n'),
+    extractText: (data: unknown) => {
+      const d = data as { content?: Array<{ type: string; text: string }> };
+      return (d.content || []).map((b) => (b.type === 'text' ? b.text : '')).filter(Boolean).join('
+');
+    },
   },
   openai: {
     label: 'OpenAI (GPT)',
@@ -65,7 +99,10 @@ const PROVIDERS: Record<
         max_tokens: 400,
       },
     }),
-    extractText: (data) => data?.choices?.[0]?.message?.content || '',
+    extractText: (data: unknown) => {
+      const d = data as { choices?: Array<{ message?: { content?: string } }> };
+      return d?.choices?.[0]?.message?.content || '';
+    },
   },
   xai: {
     label: 'Grok (xAI)',
@@ -88,7 +125,10 @@ const PROVIDERS: Record<
         max_tokens: 400,
       },
     }),
-    extractText: (data) => data?.choices?.[0]?.message?.content || '',
+    extractText: (data: unknown) => {
+      const d = data as { choices?: Array<{ message?: { content?: string } }> };
+      return d?.choices?.[0]?.message?.content || '';
+    },
   },
 };
 
@@ -105,16 +145,35 @@ const SYSTEM_NO_SEARCH =
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const providerKey = body.providerKey || 'openai';
+    // ─── Rate Limit Check ───────────────────────────────────────────────
+    const ip = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+    const rateLimit = checkRateLimit(ip);
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: `Rate limit exceeded. Retry after ${rateLimit.retryAfter}s.` },
+        { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfter) } }
+      );
+    }
+
+    // ─── Input Validation ─────────────────────────────────────────────────
+    const rawBody = await req.json();
+    const parseResult = NewsRequestSchema.safeParse(rawBody);
+    if (!parseResult.success) {
+      return NextResponse.json(
+        { error: 'Invalid request body', details: parseResult.error.format() },
+        { status: 400 }
+      );
+    }
+
+    const { providerKey, model: modelOverride, apiKey: apiKeyOverride } = parseResult.data;
     const provider = PROVIDERS[providerKey];
     if (!provider) {
       return NextResponse.json({ error: `Unknown provider "${providerKey}"` }, { status: 400 });
     }
 
-    const model = body.model || provider.defaultModel;
+    const model = modelOverride || provider.defaultModel;
     // Prefer a server-configured key; fall back to one supplied in the request.
-    const apiKey = process.env[provider.envVar] || body.apiKey;
+    const apiKey = process.env[provider.envVar] || apiKeyOverride;
     if (!apiKey) {
       return NextResponse.json(
         { error: `No API key found. Set ${provider.envVar} in your environment, or pass one from the client.` },
@@ -159,7 +218,8 @@ export async function POST(req: NextRequest) {
       providerLabel: provider.label,
       usedWebSearch: provider.supportsWebSearch,
     });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message || 'Unexpected server error' }, { status: 500 });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : 'Unexpected server error';
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

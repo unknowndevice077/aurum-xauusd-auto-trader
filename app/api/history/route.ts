@@ -7,7 +7,7 @@ export async function GET() {
     const url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1y&interval=1d';
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AurumTerminal/1.0)' },
-      next: { revalidate: 3600 }, // cache for an hour server-side
+      next: { revalidate: 300 }, // cache for 5 minutes (was 1 hour)
     });
     if (!res.ok) {
       return NextResponse.json({ error: `Yahoo Finance request failed (${res.status})` }, { status: 502 });
@@ -26,7 +26,8 @@ export async function GET() {
     }
 
     return NextResponse.json({ points, source: 'Yahoo Finance GC=F, 1y daily' });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message || 'History fetch failed' }, { status: 500 });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : 'History fetch failed';
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

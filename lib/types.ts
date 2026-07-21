@@ -44,3 +44,17 @@ export type NewsResult = {
   providerLabel: string;
   usedWebSearch: boolean;
 };
+
+export type ProviderKey = 'anthropic' | 'openai' | 'xai';
+
+export type ProviderMeta = {
+  label: string;
+  defaultModel: string;
+  supportsWebSearch: boolean;
+};
+
+export type PositionSizeResult = {
+  spend: number;
+  oz: number;
+  actualSlPct: number;
+};
