@@ -26,6 +26,7 @@ import {
   Shield,
   Target,
   Brain,
+  History,
 } from 'lucide-react';
 import PriceChart, { Candle, TIMEFRAMES, TimeframeKey } from './PriceChart';
 import {
@@ -50,6 +51,8 @@ import {
   regimeShouldBlock,
 } from '../lib/brain';
 import { getAccountTier } from '../lib/accountTier';
+import { RISK_PRESETS } from '../lib/riskPresets';
+import { runBacktest, type BacktestResult } from '../lib/backtest';
 import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from '../lib/types';
 import {
   fmtUSD,
@@ -94,36 +97,6 @@ const FONT_SERIF = "'Source Serif 4', Georgia, serif";
 const FONT_MONO = "'JetBrains Mono', 'Courier New', monospace";
 const FONT_SANS = "'Inter', -apple-system, sans-serif";
 
-// ─── Risk Presets ──────────────────────────────────────────────────────────
-const RISK_PRESETS: Record<
-  string,
-  { label: string; threshold: number; positionPct: number; slPct: number; tpPct: number; beTriggerPct: number }
-> = {
-  conservative: {
-    label: 'Conservative',
-    threshold: 0.3,
-    positionPct: 12,
-    slPct: 0.008,
-    tpPct: 0.024,
-    beTriggerPct: 0.75,
-  },
-  balanced: {
-    label: 'Balanced',
-    threshold: 0.22,
-    positionPct: 25,
-    slPct: 0.012,
-    tpPct: 0.036,
-    beTriggerPct: 0.7,
-  },
-  aggressive: {
-    label: 'Aggressive',
-    threshold: 0.15,
-    positionPct: 50,
-    slPct: 0.02,
-    tpPct: 0.06,
-    beTriggerPct: 0.65,
-  },
-};
 
 // ─── Provider Metadata ───────────────────────────────────────────────────
 const PROVIDER_META: Record<ProviderKey, ProviderMeta> = {
@@ -163,6 +136,9 @@ export default function AurumTerminal() {
   // (which gets trimmed by HISTORY_CAP) — used purely for the day/week/month
   // "market memory" monitoring panel.
   const [dailyHistory, setDailyHistory] = useState<{ t: number; p: number }[]>([]);
+  const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+  const [backtestRunning, setBacktestRunning] = useState(false);
+  const [backtestError, setBacktestError] = useState('');
   const [botRunning, setBotRunning] = useState(false);
   const [riskKey, setRiskKey] = useState('balanced');
   const [mathOnly, setMathOnly] = useState(true);
@@ -820,6 +796,32 @@ export default function AurumTerminal() {
     setStartCash(clamped);
     handleReset(clamped);
   }, [startCashInput, startCash, handleReset]);
+
+  const handleRunBacktest = useCallback(() => {
+    setBacktestError('');
+    if (dailyHistory.length === 0) {
+      setBacktestError('No historical data loaded yet — try again in a moment.');
+      return;
+    }
+    setBacktestRunning(true);
+    // Yield a frame so the "running" state actually paints before the
+    // (synchronous, fast) backtest loop runs.
+    setTimeout(() => {
+      try {
+        const result = runBacktest(dailyHistory, { riskKey, startCash });
+        if (!result) {
+          setBacktestError('Not enough historical data to backtest (need 55+ daily bars).');
+          setBacktestResult(null);
+        } else {
+          setBacktestResult(result);
+        }
+      } catch (e: unknown) {
+        setBacktestError(e instanceof Error ? e.message : 'Backtest failed');
+      } finally {
+        setBacktestRunning(false);
+      }
+    }, 10);
+  }, [dailyHistory, riskKey, startCash]);
 
   const handleResetChart = useCallback(() => {
     setPriceHistory([]);
@@ -2018,6 +2020,245 @@ export default function AurumTerminal() {
             The brain builds this table from the bot&apos;s own closed paper trades &mdash; once
             it has 6-8+ trades in a given condition it starts nudging entries toward setups that
             have worked and away from (or outright skipping) ones that haven&apos;t.
+          </div>
+        )}
+      </div>
+
+      {/* Backtest */}
+      <div
+        style={{
+          background: THEME.panel,
+          border: `1px solid ${THEME.hairline}`,
+          borderRadius: '8px',
+          padding: '14px',
+          marginBottom: '16px',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '10px',
+            marginBottom: '12px',
+          }}
+        >
+          <span
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              fontSize: '12px',
+              color: THEME.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+            }}
+          >
+            <History size={13} /> Backtest &middot; 1-year daily history
+          </span>
+          <button
+            onClick={handleRunBacktest}
+            disabled={backtestRunning || dailyHistory.length === 0}
+            aria-label="Run backtest against 1-year historical data"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: THEME.gold,
+              color: '#1A1508',
+              border: 'none',
+              borderRadius: '6px',
+              padding: '8px 14px',
+              fontFamily: FONT_SANS,
+              fontSize: '13px',
+              fontWeight: 500,
+              cursor: backtestRunning || dailyHistory.length === 0 ? 'not-allowed' : 'pointer',
+              opacity: backtestRunning || dailyHistory.length === 0 ? 0.6 : 1,
+            }}
+          >
+            {backtestRunning ? <Loader2 size={14} className="spin" /> : <History size={14} />}
+            {backtestRunning ? 'Running…' : 'Run backtest'}
+          </button>
+        </div>
+        <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '12px' }}>
+          Replays the same strategy (technical scoring, account-tier sizing, Kelly sizing, the
+          regime brain, breakeven &amp; trailing stop) against real historical GC=F daily closes,
+          using the current <strong style={{ color: THEME.text }}>{RISK_PRESETS[riskKey]?.label}</strong>{' '}
+          preset and <strong style={{ color: THEME.text }}>${fmtUSD(startCash, 0)}</strong> starting
+          capital. Two honest limits: stop/take-profit checks use daily closes, not intraday highs
+          and lows, and there&apos;s no historical news feed, so this always runs math-only.
+        </div>
+
+        {backtestError && (
+          <div style={{ fontSize: '12px', color: THEME.loss, marginBottom: '10px' }}>
+            {backtestError}
+          </div>
+        )}
+
+        {backtestResult && (
+          <>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+                gap: '10px',
+                marginBottom: '14px',
+              }}
+            >
+              {[
+                {
+                  label: 'Total return',
+                  value: `${backtestResult.totalReturnPct >= 0 ? '+' : ''}${backtestResult.totalReturnPct.toFixed(2)}%`,
+                  color: backtestResult.totalReturnPct >= 0 ? THEME.gain : THEME.loss,
+                },
+                { label: 'Final equity', value: `$${fmtUSD(backtestResult.finalEquity)}` },
+                { label: 'Trades', value: `${backtestResult.stats.totalTrades}` },
+                { label: 'Win rate', value: `${(backtestResult.stats.winRate * 100).toFixed(0)}%` },
+                {
+                  label: 'Sharpe',
+                  value: backtestResult.stats.sharpe != null ? backtestResult.stats.sharpe.toFixed(2) : '--',
+                },
+                {
+                  label: 'Max drawdown',
+                  value:
+                    backtestResult.stats.maxDrawdownPct != null
+                      ? `${backtestResult.stats.maxDrawdownPct.toFixed(2)}%`
+                      : '--',
+                  color: THEME.loss,
+                },
+              ].map((kpi) => (
+                <div
+                  key={kpi.label}
+                  style={{
+                    background: THEME.panelAlt,
+                    border: `1px solid ${THEME.hairline}`,
+                    borderRadius: '6px',
+                    padding: '8px 10px',
+                  }}
+                >
+                  <div style={{ fontSize: '10px', color: THEME.muted, marginBottom: '2px' }}>
+                    {kpi.label}
+                  </div>
+                  <div
+                    style={{
+                      fontFamily: FONT_MONO,
+                      fontSize: '14px',
+                      color: kpi.color || THEME.text,
+                    }}
+                  >
+                    {kpi.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {backtestResult.dateRange && (
+              <div style={{ fontSize: '10px', color: THEME.muted, marginBottom: '10px' }}>
+                {new Date(backtestResult.dateRange.from * 1000).toLocaleDateString()} &ndash;{' '}
+                {new Date(backtestResult.dateRange.to * 1000).toLocaleDateString()} &middot;{' '}
+                {backtestResult.barsTraded} daily bars
+              </div>
+            )}
+
+            <div style={{ height: '100px', marginBottom: '10px' }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={backtestResult.equityCurve}>
+                  <XAxis dataKey="t" hide />
+                  <YAxis domain={['auto', 'auto']} tick={{ fill: THEME.muted, fontSize: 10 }} width={50} />
+                  <Tooltip
+                    contentStyle={{
+                      background: THEME.panelAlt,
+                      border: `1px solid ${THEME.hairline}`,
+                      fontSize: '12px',
+                    }}
+                    labelFormatter={(t: number) => new Date(t * 1000).toLocaleDateString()}
+                    formatter={(v: number) => [`$${fmtUSD(v)}`, 'Equity']}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="value"
+                    stroke={THEME.gold}
+                    fill={THEME.gold}
+                    fillOpacity={0.12}
+                    strokeWidth={2}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+
+            {backtestResult.trades.length > 0 ? (
+              <div style={{ maxHeight: '220px', overflowY: 'auto' }}>
+                {backtestResult.trades.map((t) => (
+                  <div
+                    key={t.id}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '6px 0',
+                      borderBottom: `1px solid ${THEME.hairline}`,
+                      gap: '10px',
+                      fontSize: '11px',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                      <span
+                        style={{
+                          fontFamily: FONT_MONO,
+                          fontSize: '10px',
+                          padding: '2px 6px',
+                          borderRadius: '3px',
+                          background: t.side === 'BUY' ? 'rgba(91,146,121,0.15)' : 'rgba(181,83,60,0.15)',
+                          color: t.side === 'BUY' ? THEME.gain : THEME.loss,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {t.side}
+                      </span>
+                      <span
+                        style={{
+                          color: THEME.muted,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {t.time} &middot; {t.reasoning}
+                      </span>
+                    </div>
+                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                      <div style={{ fontFamily: FONT_MONO }}>
+                        {fmtOz(t.oz)} oz @ ${fmtUSD(t.price)}
+                      </div>
+                      {typeof t.pnl === 'number' && (
+                        <div
+                          style={{
+                            fontFamily: FONT_MONO,
+                            color: t.pnl >= 0 ? THEME.gain : THEME.loss,
+                          }}
+                        >
+                          {t.pnl >= 0 ? '+' : '-'}${fmtUSD(Math.abs(t.pnl))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ fontSize: '11px', color: THEME.muted }}>
+                No trades fired over this history at the current risk preset &mdash; try a less
+                conservative preset or a smaller account tier threshold bump.
+              </div>
+            )}
+          </>
+        )}
+
+        {!backtestResult && !backtestError && (
+          <div style={{ fontSize: '11px', color: THEME.muted }}>
+            {dailyHistory.length === 0
+              ? 'Loading historical data…'
+              : `${dailyHistory.length} days of real GC=F history loaded — click "Run backtest" to see how this strategy would have performed.`}
           </div>
         )}
       </div>
