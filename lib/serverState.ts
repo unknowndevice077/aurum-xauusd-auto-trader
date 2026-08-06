@@ -36,6 +36,9 @@ export type GlobalBotState = {
   lotOz: number; // fixed lot size in oz, user-chosen — not auto-scaled by capital
   useKelly: boolean; // opt-in: when true, Kelly can shrink (never grow) the lot
   consecutiveLosses: number;
+  lastExitAt: number | null; // re-entry cooldown — don't re-enter right into the noise that just exited
+  pendingEntrySince: number | null; // signal confirmation: entry score has to stay past threshold, not just touch it once
+  pendingExitSince: number | null;
   news: ServerNews | null;
   lastNewsAt: number | null;
   lastTickAt: number | null;
@@ -75,6 +78,9 @@ export function defaultState(startCash: number = DEFAULT_START_CASH_FALLBACK): G
     lotOz: DEFAULT_LOT_OZ,
     useKelly: false,
     consecutiveLosses: 0,
+    lastExitAt: null,
+    pendingEntrySince: null,
+    pendingExitSince: null,
     news: null,
     lastNewsAt: null,
     lastTickAt: null,

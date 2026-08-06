@@ -61,15 +61,27 @@ import {
 import { THEME } from '../lib/theme';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
-const TICK_MS = 4000;
+// 12s (not the original 4s) — the technical indicators (EMA12/26,
+// regression-20, z-score-20) are computed over the last 12-26 *ticks*, so
+// the tick length directly sets how much real time a "trend" represents.
+// At 4s ticks that was 48-104 seconds — not enough for any real signal,
+// just random-walk noise, which produced rapid buy/sell whipsaws that lose
+// a little value on every round-trip. 12s roughly triples that window.
+const TICK_MS = 12000;
 const HISTORY_CAP = 5000;
 // Minimum time a position must be held before a *signal-based* exit is
 // allowed to fire (stop-loss/take-profit are real risk controls and stay
-// instant). Without this, a single noisy tick right after entry — the
-// regression/z-score factors both use a short 20-tick lookback that shifts
-// every time a new price lands — could cross back through the exit
-// threshold and close the trade one tick after it opened.
-const MIN_HOLD_MS = TICK_MS * 3; // ~12s at the default 4s tick rate
+// instant).
+const MIN_HOLD_MS = TICK_MS * 3;
+// After closing a position (any reason), don't evaluate new entries for a
+// bit — otherwise the same noise that just triggered an exit can
+// immediately re-trigger an entry.
+const EXIT_COOLDOWN_MS = TICK_MS * 4;
+// A signal has to stay past the entry/exit threshold for this long —
+// checked across ticks — before it's acted on, not just touch it once.
+// This is the "confirmation" a discretionary technical trader waits for
+// instead of reacting to the very first tick that crosses a line.
+const SIGNAL_CONFIRM_MS = TICK_MS * 2;
 const TECH_WEIGHT = 0.55;
 const NEWS_WEIGHT = 0.45;
 const DEFAULT_START_CASH = 10000;
@@ -145,6 +157,9 @@ export default function AurumTerminal() {
   const resumedFromHistory = useRef(false);
   const consecutiveLossesRef = useRef(0);
   const lastTradeResultRef = useRef<'win' | 'loss' | null>(null);
+  const lastExitAtRef = useRef<number | null>(null); // re-entry cooldown
+  const pendingEntrySinceRef = useRef<number | null>(null); // signal confirmation
+  const pendingExitSinceRef = useRef<number | null>(null);
 
   // ─── Persisted State Loading ───────────────────────────────────────────
   useEffect(() => {
@@ -505,6 +520,9 @@ export default function AurumTerminal() {
               trades: [trade, ...cur.trades].slice(0, 100),
             };
             setPortfolio(portfolioRef.current);
+            lastExitAtRef.current = Date.now();
+            pendingEntrySinceRef.current = null;
+            pendingExitSinceRef.current = null;
             if (pnl < 0) {
               consecutiveLossesRef.current++;
               lastTradeResultRef.current = 'loss';
@@ -546,6 +564,9 @@ export default function AurumTerminal() {
               trades: [trade, ...cur.trades].slice(0, 100),
             };
             setPortfolio(portfolioRef.current);
+            lastExitAtRef.current = Date.now();
+            pendingEntrySinceRef.current = null;
+            pendingExitSinceRef.current = null;
             consecutiveLossesRef.current = 0;
             lastTradeResultRef.current = 'win';
           }
@@ -604,7 +625,18 @@ export default function AurumTerminal() {
               : tech;
             const heldMs = cur.entryTs != null ? Date.now() - cur.entryTs : Infinity;
             const minHoldElapsed = heldMs >= MIN_HOLD_MS;
-            if (minHoldElapsed && combined < -posThreshold) {
+            const exitSignalActive = combined < -posThreshold;
+            const nowMs = Date.now();
+            if (!exitSignalActive) {
+              pendingExitSinceRef.current = null;
+            } else if (pendingExitSinceRef.current == null) {
+              pendingExitSinceRef.current = nowMs;
+            }
+            const exitConfirmed =
+              exitSignalActive &&
+              pendingExitSinceRef.current != null &&
+              nowMs - pendingExitSinceRef.current >= SIGNAL_CONFIRM_MS;
+            if (minHoldElapsed && exitConfirmed) {
               const liveCur = portfolioRef.current;
               const proceeds = liveCur.oz * nextPrice;
               const reasoning = !posUsesNews
@@ -640,6 +672,9 @@ export default function AurumTerminal() {
                 trades: [trade, ...liveCur.trades].slice(0, 100),
               };
               setPortfolio(portfolioRef.current);
+              lastExitAtRef.current = nowMs;
+              pendingEntrySinceRef.current = null;
+              pendingExitSinceRef.current = null;
               if (pnl < 0) {
                 consecutiveLossesRef.current++;
                 lastTradeResultRef.current = 'loss';
@@ -651,9 +686,12 @@ export default function AurumTerminal() {
           }
         }
         // ─── Entry Signal ─────────────────────────────────────────────────
-        // Gate scales with account size: below the tier's reserve floor there
-        // isn't enough spare cash to justify a new position.
+        // Below the reserve floor there isn't enough spare cash to justify
+        // a new position; the cooldown blocks re-entering right after a
+        // position just closed, into the same noise that closed it.
         else if (cur.oz === 0 && cur.cash > reserveFloor) {
+          const cooldownElapsed =
+            lastExitAtRef.current == null || Date.now() - lastExitAtRef.current >= EXIT_COOLDOWN_MS;
           const tech = technicalScore(
             nextPrice,
             ema12,
@@ -678,7 +716,22 @@ export default function AurumTerminal() {
           const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
           const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
-          if (!brainBlocked && combined > adjustedThreshold + regimeAdj) {
+          // Signal confirmation: the score has to stay past the threshold
+          // for SIGNAL_CONFIRM_MS, not just touch it on one tick, before
+          // it's acted on.
+          const entrySignalActive = !brainBlocked && combined > adjustedThreshold + regimeAdj;
+          const nowMs2 = Date.now();
+          if (!entrySignalActive) {
+            pendingEntrySinceRef.current = null;
+          } else if (pendingEntrySinceRef.current == null) {
+            pendingEntrySinceRef.current = nowMs2;
+          }
+          const entryConfirmed =
+            entrySignalActive &&
+            pendingEntrySinceRef.current != null &&
+            nowMs2 - pendingEntrySinceRef.current >= SIGNAL_CONFIRM_MS;
+
+          if (cooldownElapsed && entryConfirmed) {
             // Fixed lot size, chosen directly by the user — not derived
             // from a % of capital or scaled by account size. Kelly is
             // opt-in: when enabled, it can only shrink the lot (never grow
@@ -757,6 +810,7 @@ export default function AurumTerminal() {
                 trades: [trade, ...cur.trades].slice(0, 100),
               };
               setPortfolio(portfolioRef.current);
+              pendingEntrySinceRef.current = null;
             }
           }
         }
@@ -794,6 +848,9 @@ export default function AurumTerminal() {
       setEquityCurve([]);
       consecutiveLossesRef.current = 0;
       lastTradeResultRef.current = null;
+      lastExitAtRef.current = null;
+      pendingEntrySinceRef.current = null;
+      pendingExitSinceRef.current = null;
       localStorage.setItem('aurum-portfolio', JSON.stringify(fresh));
     },
     [startCash]

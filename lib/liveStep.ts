@@ -29,6 +29,14 @@ const TECH_WEIGHT = 0.55;
 const NEWS_WEIGHT = 0.45;
 const NEWS_REFRESH_MS = 20 * 60_000; // throttle LLM calls to at most once per 20 min
 const MIN_HOLD_MS = 90_000; // at least one prior tick's worth of cadence before a signal exit
+// After closing a position, don't re-enter for a bit — otherwise the same
+// noise that just triggered an exit can immediately re-trigger an entry.
+const EXIT_COOLDOWN_MS = 5 * 60_000;
+// A signal has to stay past the entry/exit threshold across at least one
+// more tick before it's acted on, not just touch it once — the same
+// confirmation discipline a discretionary technical trader applies instead
+// of reacting to the first tick that crosses a line.
+const SIGNAL_CONFIRM_MS = 60_000;
 const FALLBACK_PRICE = 4000;
 
 async function fetchLivePrice(lastPrice: number | null): Promise<{ price: number; label: string }> {
@@ -87,6 +95,9 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
 
   let portfolio = { ...state.portfolio };
   let consecutiveLosses = state.consecutiveLosses;
+  let lastExitAt = state.lastExitAt;
+  let pendingEntrySince = state.pendingEntrySince;
+  let pendingExitSince = state.pendingExitSince;
 
   let adjustedThreshold = preset.threshold;
   if (consecutiveLosses >= 3) {
@@ -144,9 +155,15 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
             ? 'Trailing stop hit (profit locked)'
             : 'Breakeven stop hit';
         const pnl = closePosition(label2);
+        lastExitAt = now;
+        pendingEntrySince = null;
+        pendingExitSince = null;
         consecutiveLosses = pnl < 0 ? consecutiveLosses + 1 : 0;
       } else if (portfolio.tpPrice != null && nextPrice >= portfolio.tpPrice) {
         closePosition('Take-profit hit');
+        lastExitAt = now;
+        pendingEntrySince = null;
+        pendingExitSince = null;
         consecutiveLosses = 0;
       } else {
         const newPeak = Math.max(portfolio.peakPrice ?? portfolio.entryPrice, nextPrice);
@@ -172,15 +189,32 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
           nextPrice, ema12, ema26, rsi, macd, macdSignal, atr, bbWidth, prices, regression, mrz
         );
         const combined = posUsesNews ? TECH_WEIGHT * tech + NEWS_WEIGHT * sentiment : tech;
-        if (heldMs >= MIN_HOLD_MS && combined < -posThreshold) {
+
+        const exitSignalActive = combined < -posThreshold;
+        if (!exitSignalActive) {
+          pendingExitSince = null;
+        } else if (pendingExitSince == null) {
+          pendingExitSince = now;
+        }
+        const exitConfirmed =
+          exitSignalActive && pendingExitSince != null && now - pendingExitSince >= SIGNAL_CONFIRM_MS;
+
+        if (heldMs >= MIN_HOLD_MS && exitConfirmed) {
           const reasoning = !posUsesNews
             ? `Downtrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (server, math-only)`
             : `${tech <= 0 ? 'Downtrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment < 0 ? 'negative' : 'cooling'}`;
           const pnl = closePosition(reasoning);
+          lastExitAt = now;
+          pendingEntrySince = null;
+          pendingExitSince = null;
           consecutiveLosses = pnl < 0 ? consecutiveLosses + 1 : 0;
         }
       }
-    } else if (portfolio.oz === 0 && portfolio.cash > reserveFloor) {
+    } else if (
+      portfolio.oz === 0 &&
+      portfolio.cash > reserveFloor &&
+      (lastExitAt == null || now - lastExitAt >= EXIT_COOLDOWN_MS)
+    ) {
       const tech = technicalScore(
         nextPrice, ema12, ema26, rsi, macd, macdSignal, atr, bbWidth, prices, regression, mrz
       );
@@ -191,7 +225,16 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
       const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
-      if (!brainBlocked && combined > adjustedThreshold + regimeAdj) {
+      const entrySignalActive = !brainBlocked && combined > adjustedThreshold + regimeAdj;
+      if (!entrySignalActive) {
+        pendingEntrySince = null;
+      } else if (pendingEntrySince == null) {
+        pendingEntrySince = now;
+      }
+      const entryConfirmed =
+        entrySignalActive && pendingEntrySince != null && now - pendingEntrySince >= SIGNAL_CONFIRM_MS;
+
+      if (entryConfirmed) {
         let effectiveLotOz = state.lotOz;
         if (state.useKelly) {
           const stats = computeTradeStats(portfolio.trades);
@@ -244,6 +287,7 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
             positionUsesNews: canUseNews,
             trades: [trade, ...portfolio.trades].slice(0, 100),
           };
+          pendingEntrySince = null;
         }
       }
     }
@@ -262,6 +306,9 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
     portfolio,
     equityCurve,
     consecutiveLosses,
+    lastExitAt,
+    pendingEntrySince,
+    pendingExitSince,
     news,
     lastNewsAt,
     lastTickAt: now,

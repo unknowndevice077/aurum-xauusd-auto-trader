@@ -37,6 +37,12 @@ import { RISK_PRESETS, RESERVE_FLOOR_PCT, type RiskPresetKey } from './riskPrese
 import type { Trade } from './types';
 
 const WARMUP_BARS = 50; // computeIndicators needs 50+ closes before it returns real values
+// Same discipline as the live/server engines, expressed in real elapsed
+// time (bars here are ~1 day apart): don't re-enter right after an exit,
+// and require a signal to persist across at least one more bar before
+// acting on it, rather than firing on the first bar that crosses the line.
+const EXIT_COOLDOWN_SEC = 2 * 86400;
+const SIGNAL_CONFIRM_SEC = 86400;
 
 export type BacktestResult = {
   trades: Trade[]; // newest-first, matching the live trade ledger's convention
@@ -97,6 +103,9 @@ export function runBacktest(
   let positionThreshold: number | null = null;
   let positionBeTriggerPct: number | null = null;
   let consecutiveLosses = 0;
+  let lastExitAt: number | null = null;
+  let pendingEntrySince: number | null = null;
+  let pendingExitSince: number | null = null;
 
   // Chronological (oldest first) while building; reversed at the end to
   // match the live ledger's newest-first convention.
@@ -157,9 +166,15 @@ export function runBacktest(
             ? 'Trailing stop hit (profit locked)'
             : 'Breakeven stop hit';
         const pnl = closePosition(label);
+        lastExitAt = ts;
+        pendingEntrySince = null;
+        pendingExitSince = null;
         consecutiveLosses = pnl < 0 ? consecutiveLosses + 1 : 0;
       } else if (tpPrice != null && price >= tpPrice) {
         closePosition('Take-profit hit');
+        lastExitAt = ts;
+        pendingEntrySince = null;
+        pendingExitSince = null;
         consecutiveLosses = 0;
       } else {
         const newPeak = Math.max(peakPrice ?? entryPrice, price);
@@ -182,14 +197,31 @@ export function runBacktest(
         const tech = technicalScore(
           price, ema12, ema26, rsi, macd, macdSignal, atr, bbWidth, prices, regression, mrz
         );
-        if (tech < -posThreshold) {
+
+        const exitSignalActive = tech < -posThreshold;
+        if (!exitSignalActive) {
+          pendingExitSince = null;
+        } else if (pendingExitSince == null) {
+          pendingExitSince = ts;
+        }
+        const exitConfirmed =
+          exitSignalActive && pendingExitSince != null && ts - pendingExitSince >= SIGNAL_CONFIRM_SEC;
+
+        if (exitConfirmed) {
           const pnl = closePosition(
             `Downtrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (backtest, math-only)`
           );
+          lastExitAt = ts;
+          pendingEntrySince = null;
+          pendingExitSince = null;
           consecutiveLosses = pnl < 0 ? consecutiveLosses + 1 : 0;
         }
       }
-    } else if (oz === 0 && cash > reserveFloor) {
+    } else if (
+      oz === 0 &&
+      cash > reserveFloor &&
+      (lastExitAt == null || ts - lastExitAt >= EXIT_COOLDOWN_SEC)
+    ) {
       const tech = technicalScore(
         price, ema12, ema26, rsi, macd, macdSignal, atr, bbWidth, prices, regression, mrz
       );
@@ -199,7 +231,16 @@ export function runBacktest(
       const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
-      if (!brainBlocked && tech > adjustedThreshold + regimeAdj) {
+      const entrySignalActive = !brainBlocked && tech > adjustedThreshold + regimeAdj;
+      if (!entrySignalActive) {
+        pendingEntrySince = null;
+      } else if (pendingEntrySince == null) {
+        pendingEntrySince = ts;
+      }
+      const entryConfirmed =
+        entrySignalActive && pendingEntrySince != null && ts - pendingEntrySince >= SIGNAL_CONFIRM_SEC;
+
+      if (entryConfirmed) {
         // Fixed lot size by default — the user's chosen oz amount is used
         // exactly. Kelly is opt-in: when enabled, it can only shrink the
         // lot (never grow it beyond what was requested), based on realized
@@ -245,6 +286,7 @@ export function runBacktest(
           beActive = false;
           positionThreshold = adjustedThreshold;
           positionBeTriggerPct = preset.beTriggerPct;
+          pendingEntrySince = null;
         }
       }
     }
