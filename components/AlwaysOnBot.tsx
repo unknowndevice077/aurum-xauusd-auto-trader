@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AreaChart,
   Area,
@@ -12,9 +12,10 @@ import {
 import { Play, Pause, RotateCcw, Radio, AlertTriangle, Newspaper } from 'lucide-react';
 import { THEME, FONT_SERIF, FONT_MONO, FONT_SANS } from '../lib/theme';
 import { RISK_PRESETS, MAX_LEVERAGE } from '../lib/riskPresets';
-import { fmtUSD, fmtOz } from '../lib/helpers';
+import { fmtUSD, fmtOz, buildCandles } from '../lib/helpers';
 import { markToMarketEquity } from '../lib/quant';
 import type { GlobalBotState } from '../lib/serverState';
+import PriceChart, { TIMEFRAMES, TimeframeKey } from './PriceChart';
 
 const POLL_MS = 5000;
 
@@ -33,6 +34,11 @@ export default function AlwaysOnBot() {
   const [startCashInput, setStartCashInput] = useState('10000');
   const [lotOzInput, setLotOzInput] = useState('0.05');
   const lotOzSynced = React.useRef(false);
+  // Server-tick spacing is whatever the external cron's interval is
+  // (typically 1-5 min), not the local sim's sub-second cadence, so '1D'
+  // (one candle per raw tick, no grouping) is the most honest default —
+  // the finest resolution actually available for this bot's own data.
+  const [timeframe, setTimeframe] = useState<TimeframeKey>('1D');
 
   const refresh = useCallback(async () => {
     try {
@@ -94,6 +100,12 @@ export default function AlwaysOnBot() {
       setLotOzInput(String(state.lotOz));
     }
   }, [lotOzInput, sendControl, state]);
+
+  const activeGroupSize = TIMEFRAMES.find((t) => t.key === timeframe)?.groupSize ?? 1;
+  const candles = useMemo(
+    () => buildCandles(state?.priceHistory ?? [], activeGroupSize),
+    [state?.priceHistory, activeGroupSize]
+  );
 
   if (!state) {
     return (
@@ -424,6 +436,37 @@ export default function AlwaysOnBot() {
             )}
           </div>
         ))}
+      </div>
+
+      {/* Price chart */}
+      <div
+        style={{
+          background: THEME.panel,
+          border: `1px solid ${THEME.hairline}`,
+          borderRadius: '8px',
+          padding: '14px',
+          marginBottom: '16px',
+        }}
+      >
+        {candles.length > 0 ? (
+          <PriceChart
+            candles={candles}
+            height={280}
+            timeframe={timeframe}
+            onTimeframeChange={setTimeframe}
+            entryPrice={state.portfolio.oz > 0 ? state.portfolio.entryPrice : null}
+            slPrice={state.portfolio.oz > 0 ? state.portfolio.slPrice : null}
+            tpPrice={state.portfolio.oz > 0 ? state.portfolio.tpPrice : null}
+            beActive={state.portfolio.beActive}
+            trades={state.portfolio.trades}
+          />
+        ) : (
+          <div style={{ fontSize: '12px', color: THEME.muted, padding: '8px 0' }}>
+            No price history yet — this fills in once the cron starts ticking the bot (each tick
+            records one price point; candle grouping matches the cron's own interval, not a fixed
+            clock time).
+          </div>
+        )}
       </div>
 
       {/* Open position */}
