@@ -201,6 +201,10 @@ export default function AurumTerminal() {
           setStartCashInput(String(val));
         }
       }
+      const storedBotRunning = localStorage.getItem('aurum-bot-running');
+      if (storedBotRunning === 'true') {
+        setBotRunning(true);
+      }
       const storedConfig = localStorage.getItem('aurum-llm-config');
       if (storedConfig) {
         const parsed = JSON.parse(storedConfig);
@@ -260,6 +264,11 @@ export default function AurumTerminal() {
     if (!loaded) return;
     localStorage.setItem('aurum-start-cash', String(startCash));
   }, [startCash, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem('aurum-bot-running', String(botRunning));
+  }, [botRunning, loaded]);
 
   useEffect(() => {
     historyRef.current = priceHistory;
