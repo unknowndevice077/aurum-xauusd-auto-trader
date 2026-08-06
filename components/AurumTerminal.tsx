@@ -339,7 +339,7 @@ export default function AurumTerminal() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch('/api/history?range=max');
+        const res = await fetch('/api/history?range=25y');
         const json = await res.json();
         if (!cancelled && !json.error && Array.isArray(json.points) && json.points.length > 0) {
           setDailyHistory(json.points);

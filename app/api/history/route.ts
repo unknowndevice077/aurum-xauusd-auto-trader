@@ -1,15 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const ALLOWED_RANGES = new Set(['1y', '2y', '5y', '10y', 'max']);
+// Deliberately excludes 'max': Yahoo silently switches to ~monthly
+// granularity for that value even with interval=1d requested (verified —
+// 'max' returned 267 points spanning 26 years, i.e. ~10/year; every
+// explicit range up to 25y returns genuinely daily data, ~252/year, over
+// essentially the same span). Every indicator in this app (RSI14, EMA12/26,
+// ATR14, the anomaly-move threshold) is calibrated assuming daily bars, so
+// silently getting monthly bars would quietly invalidate all of them.
+const ALLOWED_RANGES = new Set(['1y', '2y', '5y', '10y', '25y']);
 
 // Yahoo Finance's chart endpoint is unauthenticated and CORS-blocked from the browser,
 // so this runs server-side and the client just calls our own /api/history.
-// Defaults to 'max' so the backtest can offer a real year picker instead of
-// being stuck with whatever the last 12 months happened to look like.
+// Defaults to 25y (the longest range confirmed to stay truly daily) so the
+// backtest can offer a real year picker instead of being stuck with
+// whatever the last 12 months happened to look like.
 export async function GET(req: NextRequest) {
   try {
-    const requested = req.nextUrl.searchParams.get('range') || 'max';
-    const range = ALLOWED_RANGES.has(requested) ? requested : 'max';
+    const requested = req.nextUrl.searchParams.get('range') || '25y';
+    const range = ALLOWED_RANGES.has(requested) ? requested : '25y';
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=${range}&interval=1d`;
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AurumTerminal/1.0)' },
