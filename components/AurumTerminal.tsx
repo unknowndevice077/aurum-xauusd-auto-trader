@@ -25,15 +25,39 @@ import {
   KeyRound,
   Shield,
   Target,
+  Brain,
 } from 'lucide-react';
 import PriceChart, { Candle, TIMEFRAMES, TimeframeKey } from './PriceChart';
 import {
   computeIndicators,
   technicalScore,
   calculatePositionSize,
-  smaSeriesFull,
-} from './indicators';
-import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from './types';
+} from '../lib/indicators';
+import {
+  linearRegression,
+  zScore,
+  winProbability,
+  newsEffectiveWeight,
+  computeTradeStats,
+  kellyFraction,
+  trendSummary,
+} from '../lib/quant';
+import {
+  classifyRegime,
+  regimeKey,
+  computeRegimeStats,
+  regimeThresholdAdjustment,
+  regimeShouldBlock,
+} from '../lib/brain';
+import { getAccountTier } from '../lib/accountTier';
+import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from '../lib/types';
+import {
+  fmtUSD,
+  fmtOz,
+  buildCandles,
+  backfillTradePnl,
+  fetchNewsAnalysis,
+} from '../lib/helpers';
 
 // ─── Theme ─────────────────────────────────────────────────────────────────
 const THEME = {
@@ -52,9 +76,18 @@ const THEME = {
 // ─── Constants ─────────────────────────────────────────────────────────────
 const TICK_MS = 4000;
 const HISTORY_CAP = 5000;
+// Minimum time a position must be held before a *signal-based* exit is
+// allowed to fire (stop-loss/take-profit are real risk controls and stay
+// instant). Without this, a single noisy tick right after entry — the
+// regression/z-score factors both use a short 20-tick lookback that shifts
+// every time a new price lands — could cross back through the exit
+// threshold and close the trade one tick after it opened.
+const MIN_HOLD_MS = TICK_MS * 3; // ~12s at the default 4s tick rate
 const TECH_WEIGHT = 0.55;
 const NEWS_WEIGHT = 0.45;
-const START_CASH = 10000;
+const DEFAULT_START_CASH = 10000;
+const MIN_START_CASH = 1;
+const MAX_START_CASH = 10_000_000;
 const FALLBACK_PRICE = 4000;
 
 const FONT_SERIF = "'Source Serif 4', Georgia, serif";
@@ -99,90 +132,7 @@ const PROVIDER_META: Record<ProviderKey, ProviderMeta> = {
   xai: { label: 'Grok (xAI)', defaultModel: 'grok-4', supportsWebSearch: false },
 };
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
-function fmtUSD(n: number | null | undefined, decimals = 2): string {
-  if (n === null || n === undefined || isNaN(n)) return '--';
-  return n.toLocaleString('en-US', {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  });
-}
 
-function buildCandles(rawPoints: { t: number; p: number }[], groupSize: number): Candle[] {
-  const points = rawPoints.filter(
-    (pt) =>
-      pt &&
-      typeof pt.t === 'number' &&
-      typeof pt.p === 'number' &&
-      !isNaN(pt.t) &&
-      !isNaN(pt.p)
-  );
-  const prices = points.map((pt) => pt.p);
-  const sma20s = smaSeriesFull(prices, 20);
-  const sma50s = smaSeriesFull(prices, 50);
-  const candles: Candle[] = [];
-  for (let i = 0; i < points.length; i += groupSize) {
-    const chunk = points.slice(i, i + groupSize);
-    if (chunk.length === 0) continue;
-    const endIdx = Math.min(i + groupSize, points.length) - 1;
-    const o = chunk[0].p;
-    const c = chunk[chunk.length - 1].p;
-    const h = Math.max(...chunk.map((pt) => pt.p));
-    const l = Math.min(...chunk.map((pt) => pt.p));
-    candles.push({
-      time: chunk[0].t,
-      o,
-      h,
-      l,
-      c,
-      sma20: sma20s[endIdx],
-      sma50: sma50s[endIdx],
-    });
-  }
-  return candles;
-}
-
-function backfillTradePnl(trades: Trade[]): Trade[] {
-  const chronological = [...trades].reverse();
-  let openBuy: Trade | null = null;
-  const withPnl = chronological.map((t) => {
-    if (t.side === 'BUY') {
-      openBuy = t;
-      return t;
-    }
-    if (typeof t.pnl === 'number') {
-      openBuy = null;
-      return t;
-    }
-    if (openBuy) {
-      const pnl = (t.price - openBuy.price) * t.oz;
-      const pnlPct = ((t.price - openBuy.price) / openBuy.price) * 100;
-      openBuy = null;
-      return { ...t, pnl, pnlPct };
-    }
-    return t;
-  });
-  return withPnl.reverse();
-}
-
-async function fetchNewsAnalysis({
-  providerKey,
-  apiKey,
-  model,
-}: {
-  providerKey: ProviderKey;
-  apiKey: string;
-  model: string;
-}): Promise<NewsResult> {
-  const res = await fetch('/api/news', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ providerKey, apiKey, model }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'News request failed');
-  return data as NewsResult;
-}
 
 // ─── Component ─────────────────────────────────────────────────────────────
 export default function AurumTerminal() {
@@ -190,10 +140,16 @@ export default function AurumTerminal() {
   const [price, setPrice] = useState<number | null>(null);
   const [dataSourceLabel, setDataSourceLabel] = useState('Seeding price feed...');
   const [priceHistory, setPriceHistory] = useState<{ t: number; p: number }[]>([]);
+  // Starting capital — configurable so the bot's sizing/selectivity can
+  // scale to the account, from a $10 micro account up through six figures.
+  const [startCash, setStartCash] = useState(DEFAULT_START_CASH);
+  const [startCashInput, setStartCashInput] = useState(String(DEFAULT_START_CASH));
   const [portfolio, setPortfolio] = useState<Portfolio>({
-    cash: START_CASH,
+    cash: DEFAULT_START_CASH,
     oz: 0,
     entryPrice: null,
+    entryTs: null,
+    peakPrice: null,
     slPrice: null,
     tpPrice: null,
     beActive: false,
@@ -203,6 +159,10 @@ export default function AurumTerminal() {
     trades: [],
   });
   const [equityCurve, setEquityCurve] = useState<{ t: number; value: number }[]>([]);
+  // Real, uncapped 1y daily history — independent of the live tick buffer
+  // (which gets trimmed by HISTORY_CAP) — used purely for the day/week/month
+  // "market memory" monitoring panel.
+  const [dailyHistory, setDailyHistory] = useState<{ t: number; p: number }[]>([]);
   const [botRunning, setBotRunning] = useState(false);
   const [riskKey, setRiskKey] = useState('balanced');
   const [mathOnly, setMathOnly] = useState(true);
@@ -235,6 +195,8 @@ export default function AurumTerminal() {
         if (parsed && typeof parsed.cash === 'number') {
           setPortfolio({
             entryPrice: null,
+            entryTs: null,
+            peakPrice: null,
             slPrice: null,
             tpPrice: null,
             beActive: false,
@@ -253,6 +215,14 @@ export default function AurumTerminal() {
             }
           }
           consecutiveLossesRef.current = consecutiveLosses;
+        }
+      }
+      const storedStartCash = localStorage.getItem('aurum-start-cash');
+      if (storedStartCash) {
+        const val = Number(storedStartCash);
+        if (Number.isFinite(val) && val >= MIN_START_CASH && val <= MAX_START_CASH) {
+          setStartCash(val);
+          setStartCashInput(String(val));
         }
       }
       const storedConfig = localStorage.getItem('aurum-llm-config');
@@ -298,8 +268,8 @@ export default function AurumTerminal() {
       if (storedTf && TIMEFRAMES.some((t) => t.key === storedTf)) {
         setTimeframe(storedTf as TimeframeKey);
       }
-    } catch {
-      // ignore parse errors
+    } catch (e) {
+      console.error("Failed to load from localStorage", e);
     }
     setLoaded(true);
   }, []);
@@ -309,6 +279,11 @@ export default function AurumTerminal() {
     if (!loaded) return;
     localStorage.setItem('aurum-portfolio', JSON.stringify(portfolio));
   }, [portfolio, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem('aurum-start-cash', String(startCash));
+  }, [startCash, loaded]);
 
   useEffect(() => {
     historyRef.current = priceHistory;
@@ -381,6 +356,29 @@ export default function AurumTerminal() {
     };
   }, [loaded]);
 
+  // ─── Daily History (for week/month market memory) ──────────────────────
+  // Fetched independently of the resumed-session check above so the
+  // monitoring panel always has real week/month context, even when the live
+  // tick buffer was restored from localStorage.
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/history');
+        const json = await res.json();
+        if (!cancelled && !json.error && Array.isArray(json.points) && json.points.length > 0) {
+          setDailyHistory(json.points);
+        }
+      } catch {
+        // Non-critical — the monitoring panel just shows "not enough data" if this fails.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loaded]);
+
   // ─── News ────────────────────────────────────────────────────────────────
   const canUseNews = !mathOnly;
 
@@ -415,7 +413,15 @@ export default function AurumTerminal() {
   useEffect(() => {
     if (price === null) return;
     const id = setInterval(() => {
-      const sentiment = canUseNews && newsRef.current ? newsRef.current.sentiment_score : 0;
+      // News sentiment is time-decayed (15min half-life) and scaled by the
+      // model's own self-reported confidence, so a stale or low-confidence
+      // read stops dominating the decision the way a fresh, confident one does.
+      const newsAgeWeight =
+        canUseNews && newsRef.current
+          ? newsEffectiveWeight(Date.now() - newsRef.current.ts, newsRef.current.confidence)
+          : 0;
+      const sentiment =
+        canUseNews && newsRef.current ? newsRef.current.sentiment_score * newsAgeWeight : 0;
       const drift = sentiment * 0.0006;
       const noise = (Math.random() - 0.5) * 0.004;
       const nextPrice = Math.max(1, (priceRef.current as number) * (1 + drift + noise));
@@ -432,17 +438,39 @@ export default function AurumTerminal() {
       const rawPrices = nextHistory.map((pt) => pt.p);
       const indicators = computeIndicators(rawPrices);
       const { ema12, ema26, rsi, atr, bbWidth, macd, macdSignal } = indicators;
+      // Quant overlay: trend regression (slope + R²) and a mean-reversion
+      // z-score, both folded into technicalScore as extra graduated factors.
+      const regression = linearRegression(rawPrices, 20);
+      const mrz = zScore(rawPrices, 20);
+      // The "brain": classify the current market condition into a regime
+      // bucket and look up how the bot's own past trades performed in that
+      // exact bucket, so it can lean into conditions that have worked and
+      // pull back (or refuse to trade) in conditions that historically haven't.
+      const regimeNow = classifyRegime(
+        regression,
+        rsi,
+        bbWidth,
+        canUseNews ? newsRef.current?.bias ?? null : null
+      );
+      const regimeNowKey = regimeKey(regimeNow);
+      // Account-size-aware risk tiering: a $10 account gets smaller bets,
+      // pickier entries, and a bigger untouchable cash cushion than a
+      // $10,000 one, even though both use the same % math underneath.
+      const tier = getAccountTier(startCash);
+      const reserveFloor = Math.max(startCash * tier.reserveFloorPct, 0.01);
 
       if (botRunning) {
         const cur = portfolioRef.current;
         const preset = RISK_PRESETS[riskKey];
 
-        // Dynamic threshold adjustment based on losing streak
-        let adjustedThreshold = preset.threshold;
+        // Dynamic threshold adjustment based on losing streak, plus the
+        // account tier's selectivity bump (micro/small accounts demand a
+        // cleaner signal before committing capital they can't spare).
+        let adjustedThreshold = preset.threshold + tier.thresholdBump;
         if (consecutiveLossesRef.current >= 3) {
           adjustedThreshold = Math.min(
             0.5,
-            preset.threshold * (1 + consecutiveLossesRef.current * 0.15)
+            adjustedThreshold * (1 + consecutiveLossesRef.current * 0.15)
           );
         }
 
@@ -454,7 +482,11 @@ export default function AurumTerminal() {
           // ─── Stop-Loss Hit ───────────────────────────────────────────────
           if (cur.slPrice != null && nextPrice <= cur.slPrice) {
             const proceeds = cur.oz * nextPrice;
-            const label = cur.beActive ? 'Breakeven stop hit' : 'Stop-loss hit';
+            const label = !cur.beActive
+              ? 'Stop-loss hit'
+              : cur.entryPrice != null && cur.slPrice > cur.entryPrice
+                ? 'Trailing stop hit (profit locked)'
+                : 'Breakeven stop hit';
             const pnl = (nextPrice - cur.entryPrice) * cur.oz;
             const pnlPct = ((nextPrice - cur.entryPrice) / cur.entryPrice) * 100;
             const trade: Trade = {
@@ -474,6 +506,8 @@ export default function AurumTerminal() {
               cash: cur.cash + proceeds,
               oz: 0,
               entryPrice: null,
+              entryTs: null,
+              peakPrice: null,
               slPrice: null,
               tpPrice: null,
               beActive: false,
@@ -513,6 +547,8 @@ export default function AurumTerminal() {
               cash: cur.cash + proceeds,
               oz: 0,
               entryPrice: null,
+              entryTs: null,
+              peakPrice: null,
               slPrice: null,
               tpPrice: null,
               beActive: false,
@@ -525,13 +561,39 @@ export default function AurumTerminal() {
             consecutiveLossesRef.current = 0;
             lastTradeResultRef.current = 'win';
           }
-          // ─── Breakeven Trigger ───────────────────────────────────────────
+          // ─── Breakeven Arm & Trailing Stop ───────────────────────────────
           else {
+            // Track the highest price seen since entry — this is what the
+            // trailing stop rides behind once armed.
+            const peakPrice = Math.max(cur.peakPrice ?? cur.entryPrice, nextPrice);
+
             if (!cur.beActive && cur.tpPrice != null) {
               const beTriggerPrice =
                 cur.entryPrice + (cur.tpPrice - cur.entryPrice) * posBeTriggerPct;
               if (nextPrice >= beTriggerPrice) {
-                portfolioRef.current = { ...cur, slPrice: cur.entryPrice, beActive: true };
+                // Arm: jump SL to breakeven and start trailing from here.
+                portfolioRef.current = {
+                  ...cur,
+                  slPrice: cur.entryPrice,
+                  beActive: true,
+                  peakPrice,
+                };
+                setPortfolio(portfolioRef.current);
+              } else if (peakPrice !== cur.peakPrice) {
+                portfolioRef.current = { ...cur, peakPrice };
+                setPortfolio(portfolioRef.current);
+              }
+            } else if (cur.beActive) {
+              // Once armed, ratchet the stop up behind the peak instead of
+              // leaving it parked at breakeven — an ATR-based trail distance
+              // when available (matching how the initial stop was sized),
+              // otherwise a fraction of the preset's stop-loss %. The stop
+              // only ever moves up, and never below entry.
+              const trailDistance = atr ? atr * 1.5 : nextPrice * preset.slPct * 0.6;
+              const candidateSl = Math.max(cur.entryPrice, peakPrice - trailDistance);
+              const nextSl = Math.max(cur.slPrice ?? cur.entryPrice, candidateSl);
+              if (nextSl !== cur.slPrice || peakPrice !== cur.peakPrice) {
+                portfolioRef.current = { ...cur, slPrice: nextSl, peakPrice };
                 setPortfolio(portfolioRef.current);
               }
             }
@@ -545,12 +607,16 @@ export default function AurumTerminal() {
               macdSignal,
               atr,
               bbWidth,
-              rawPrices
+              rawPrices,
+              regression,
+              mrz
             );
             const combined = posUsesNews
               ? TECH_WEIGHT * tech + NEWS_WEIGHT * sentiment
               : tech;
-            if (combined < -posThreshold) {
+            const heldMs = cur.entryTs != null ? Date.now() - cur.entryTs : Infinity;
+            const minHoldElapsed = heldMs >= MIN_HOLD_MS;
+            if (minHoldElapsed && combined < -posThreshold) {
               const liveCur = portfolioRef.current;
               const proceeds = liveCur.oz * nextPrice;
               const reasoning = !posUsesNews
@@ -575,6 +641,8 @@ export default function AurumTerminal() {
                 cash: liveCur.cash + proceeds,
                 oz: 0,
                 entryPrice: null,
+                entryTs: null,
+                peakPrice: null,
                 slPrice: null,
                 tpPrice: null,
                 beActive: false,
@@ -595,7 +663,9 @@ export default function AurumTerminal() {
           }
         }
         // ─── Entry Signal ─────────────────────────────────────────────────
-        else if (cur.oz === 0 && cur.cash > 10) {
+        // Gate scales with account size: below the tier's reserve floor there
+        // isn't enough spare cash to justify a new position.
+        else if (cur.oz === 0 && cur.cash > reserveFloor) {
           const tech = technicalScore(
             nextPrice,
             ema12,
@@ -605,50 +675,99 @@ export default function AurumTerminal() {
             macdSignal,
             atr,
             bbWidth,
-            rawPrices
+            rawPrices,
+            regression,
+            mrz
           );
           const combined = canUseNews
             ? TECH_WEIGHT * tech + NEWS_WEIGHT * sentiment
             : tech;
 
-          if (combined > adjustedThreshold) {
-            const { spend, oz, actualSlPct } = calculatePositionSize(
+          // Brain lookup: has this exact market regime historically been a
+          // winner or a loser for this bot's own trades?
+          const regimeStatsNow = computeRegimeStats(cur.trades);
+          const matchedRegimeStat = regimeStatsNow.find((s) => s.regime === regimeNowKey);
+          const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
+          const brainBlocked = regimeShouldBlock(matchedRegimeStat);
+
+          if (!brainBlocked && combined > adjustedThreshold + regimeAdj) {
+            // Kelly-criterion position sizing: once we have enough closed-trade
+            // history, size the bet by our actual realized edge (win rate vs.
+            // avg win/loss) rather than a fixed % — a thin or negative edge
+            // shrinks the bet instead of always betting the preset max. The
+            // account tier further caps how large a single bet is allowed
+            // to be relative to the risk preset (smaller accounts get a
+            // tighter cap).
+            const stats = computeTradeStats(cur.trades);
+            const kelly = kellyFraction(
+              stats.winRate,
+              stats.avgWinPct,
+              stats.avgLossPct,
+              8,
+              stats.totalTrades
+            );
+            const tierCappedPositionPct = preset.positionPct * tier.positionCapMultiplier;
+            const effectivePositionPct =
+              kelly != null ? Math.min(tierCappedPositionPct, kelly * 100) : tierCappedPositionPct;
+
+            const sized = calculatePositionSize(
               cur.cash,
-              preset.positionPct,
+              effectivePositionPct,
               nextPrice,
               atr,
               preset.slPct
             );
-            // FIX: Use actualSlPct from calculatePositionSize instead of preset.slPct
-            const slPrice = nextPrice * (1 - actualSlPct);
-            const tpPrice = nextPrice * (1 + preset.tpPct);
-            const reasoning = !canUseNews
-              ? `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (math-only)`
-              : `${tech >= 0 ? 'Uptrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment >= 0 ? 'supportive' : 'cautious'}${newsRef.current?.key_driver ? ' (' + newsRef.current.key_driver + ')' : ''}`;
-            const trade: Trade = {
-              id: Date.now(),
-              ts: nowSec,
-              time: new Date().toLocaleTimeString(),
-              side: 'BUY',
-              price: nextPrice,
-              oz,
-              value: spend,
-              reasoning: `${reasoning} · SL $${fmtUSD(slPrice)} / TP $${fmtUSD(tpPrice)}${atr ? ' · ATR $' + fmtUSD(atr) : ''}`,
-            };
-            portfolioRef.current = {
-              ...cur,
-              cash: cur.cash - spend,
-              oz: cur.oz + oz,
-              entryPrice: nextPrice,
-              slPrice,
-              tpPrice,
-              beActive: false,
-              positionThreshold: adjustedThreshold,
-              positionBeTriggerPct: preset.beTriggerPct,
-              positionUsesNews: canUseNews,
-              trades: [trade, ...cur.trades].slice(0, 100),
-            };
-            setPortfolio(portfolioRef.current);
+            // Never let a single entry breach the account's reserve floor —
+            // clamp spend down (proportionally, so oz stays consistent) if
+            // it would.
+            const maxSpend = Math.max(0, cur.cash - reserveFloor);
+            const spendScale = sized.spend > 0 ? Math.min(1, maxSpend / sized.spend) : 0;
+            const spend = sized.spend * spendScale;
+            const oz = sized.oz * spendScale;
+            const actualSlPct = sized.actualSlPct;
+
+            // Skip dust-sized entries (e.g. a micro account already near
+            // its reserve floor) rather than opening a position too small
+            // to meaningfully track.
+            if (spend >= 0.01 && oz > 0) {
+              // FIX: Use actualSlPct from calculatePositionSize instead of preset.slPct
+              const slPrice = nextPrice * (1 - actualSlPct);
+              const tpPrice = nextPrice * (1 + preset.tpPct);
+              const reasoning = !canUseNews
+                ? `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (math-only)`
+                : `${tech >= 0 ? 'Uptrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment >= 0 ? 'supportive' : 'cautious'}${newsRef.current?.key_driver ? ' (' + newsRef.current.key_driver + ')' : ''}`;
+              const brainNote =
+                matchedRegimeStat && matchedRegimeStat.trades >= 6
+                  ? ` · brain: ${(matchedRegimeStat.winRate * 100).toFixed(0)}% win in "${regimeNowKey}" (${matchedRegimeStat.trades} past trades)`
+                  : '';
+              const trade: Trade = {
+                id: Date.now(),
+                ts: nowSec,
+                time: new Date().toLocaleTimeString(),
+                side: 'BUY',
+                price: nextPrice,
+                oz,
+                value: spend,
+                reasoning: `${reasoning} · SL $${fmtUSD(slPrice)} / TP $${fmtUSD(tpPrice)}${atr ? ' · ATR $' + fmtUSD(atr) : ''}${brainNote}`,
+                regime: regimeNowKey,
+              };
+              portfolioRef.current = {
+                ...cur,
+                cash: cur.cash - spend,
+                oz: cur.oz + oz,
+                entryPrice: nextPrice,
+                entryTs: Date.now(),
+                peakPrice: nextPrice,
+                slPrice,
+                tpPrice,
+                beActive: false,
+                positionThreshold: adjustedThreshold,
+                positionBeTriggerPct: preset.beTriggerPct,
+                positionUsesNews: canUseNews,
+                trades: [trade, ...cur.trades].slice(0, 100),
+              };
+              setPortfolio(portfolioRef.current);
+            }
           }
         }
       }
@@ -660,29 +779,47 @@ export default function AurumTerminal() {
       });
     }, TICK_MS);
     return () => clearInterval(id);
-  }, [price, botRunning, riskKey, canUseNews]);
+  }, [price, botRunning, riskKey, canUseNews, startCash]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────
-  const handleReset = useCallback(() => {
-    setBotRunning(false);
-    const fresh: Portfolio = {
-      cash: START_CASH,
-      oz: 0,
-      entryPrice: null,
-      slPrice: null,
-      tpPrice: null,
-      beActive: false,
-      positionThreshold: null,
-      positionBeTriggerPct: null,
-      positionUsesNews: null,
-      trades: [],
-    };
-    setPortfolio(fresh);
-    setEquityCurve([]);
-    consecutiveLossesRef.current = 0;
-    lastTradeResultRef.current = null;
-    localStorage.setItem('aurum-portfolio', JSON.stringify(fresh));
-  }, []);
+  const handleReset = useCallback(
+    (newStartCash?: number) => {
+      setBotRunning(false);
+      const cashAmount = newStartCash ?? startCash;
+      const fresh: Portfolio = {
+        cash: cashAmount,
+        oz: 0,
+        entryPrice: null,
+        entryTs: null,
+        peakPrice: null,
+        slPrice: null,
+        tpPrice: null,
+        beActive: false,
+        positionThreshold: null,
+        positionBeTriggerPct: null,
+        positionUsesNews: null,
+        trades: [],
+      };
+      setPortfolio(fresh);
+      setEquityCurve([]);
+      consecutiveLossesRef.current = 0;
+      lastTradeResultRef.current = null;
+      localStorage.setItem('aurum-portfolio', JSON.stringify(fresh));
+    },
+    [startCash]
+  );
+
+  const handleApplyStartCash = useCallback(() => {
+    const val = parseFloat(startCashInput);
+    if (!Number.isFinite(val) || val <= 0) {
+      setStartCashInput(String(startCash));
+      return;
+    }
+    const clamped = Math.max(MIN_START_CASH, Math.min(MAX_START_CASH, val));
+    setStartCashInput(String(clamped));
+    setStartCash(clamped);
+    handleReset(clamped);
+  }, [startCashInput, startCash, handleReset]);
 
   const handleResetChart = useCallback(() => {
     setPriceHistory([]);
@@ -705,9 +842,65 @@ export default function AurumTerminal() {
   const indicators = useMemo(() => computeIndicators(rawPrices), [rawPrices]);
   const { ema12, ema26, rsi, atr, bbWidth, macd, macdSignal } = indicators;
 
+  const regression = useMemo(() => linearRegression(rawPrices, 20), [rawPrices]);
+  const meanReversionZ = useMemo(() => zScore(rawPrices, 20), [rawPrices]);
+  const newsAgeWeight =
+    canUseNews && news ? newsEffectiveWeight(Date.now() - news.ts, news.confidence) : 0;
+  const effectiveSentiment = canUseNews && news ? news.sentiment_score * newsAgeWeight : 0;
+  const currentTechScore =
+    price != null
+      ? technicalScore(
+          price,
+          ema12,
+          ema26,
+          rsi,
+          macd,
+          macdSignal,
+          atr,
+          bbWidth,
+          rawPrices,
+          regression,
+          meanReversionZ
+        )
+      : 0;
+  const currentCombinedScore = canUseNews
+    ? TECH_WEIGHT * currentTechScore + NEWS_WEIGHT * effectiveSentiment
+    : currentTechScore;
+  const currentWinProbability = winProbability(currentCombinedScore);
+  const tradeStats = useMemo(() => computeTradeStats(portfolio.trades), [portfolio.trades]);
+  const currentKelly = kellyFraction(
+    tradeStats.winRate,
+    tradeStats.avgWinPct,
+    tradeStats.avgLossPct,
+    8,
+    tradeStats.totalTrades
+  );
+
+  // ─── Market Memory ("Brain") ──────────────────────────────────────────
+  const currentRegime = useMemo(
+    () => classifyRegime(regression, rsi, bbWidth, canUseNews ? news?.bias ?? null : null),
+    [regression, rsi, bbWidth, canUseNews, news]
+  );
+  const currentRegimeStr = regimeKey(currentRegime);
+  const regimeStatsAll = useMemo(() => computeRegimeStats(portfolio.trades), [portfolio.trades]);
+  const currentRegimeStat = regimeStatsAll.find((s) => s.regime === currentRegimeStr);
+  const dayTrend = useMemo(
+    () => trendSummary(priceHistory, 24 * 60 * 60 * 1000),
+    [priceHistory]
+  );
+  const weekTrend = useMemo(
+    () => trendSummary(dailyHistory, 7 * 24 * 60 * 60 * 1000),
+    [dailyHistory]
+  );
+  const monthTrend = useMemo(
+    () => trendSummary(dailyHistory, 30 * 24 * 60 * 60 * 1000),
+    [dailyHistory]
+  );
+
+  const accountTier = useMemo(() => getAccountTier(startCash), [startCash]);
   const equityValue = price ? portfolio.cash + portfolio.oz * price : portfolio.cash;
-  const pnl = equityValue - START_CASH;
-  const pnlPct = (pnl / START_CASH) * 100;
+  const pnl = equityValue - startCash;
+  const pnlPct = startCash > 0 ? (pnl / startCash) * 100 : 0;
   const biasColor =
     news?.bias === 'bullish'
       ? THEME.gain
@@ -818,6 +1011,104 @@ export default function AurumTerminal() {
             marginBottom: '20px',
           }}
         >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              marginBottom: '12px',
+              fontSize: '12px',
+              color: THEME.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+            }}
+          >
+            <Target size={13} /> Account size
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'flex-end',
+              gap: '10px',
+              flexWrap: 'wrap',
+              marginBottom: '10px',
+            }}
+          >
+            <div>
+              <label
+                style={{
+                  fontSize: '11px',
+                  color: THEME.muted,
+                  display: 'block',
+                  marginBottom: '4px',
+                }}
+              >
+                Starting capital ($)
+              </label>
+              <input
+                className="aurum-input"
+                type="number"
+                min={MIN_START_CASH}
+                max={MAX_START_CASH}
+                step="1"
+                value={startCashInput}
+                onChange={(e) => setStartCashInput(e.target.value)}
+                style={{
+                  width: '140px',
+                  background: THEME.panel,
+                  color: THEME.text,
+                  border: `1px solid ${THEME.hairline}`,
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  fontSize: '13px',
+                  fontFamily: FONT_MONO,
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            <button
+              onClick={handleApplyStartCash}
+              aria-label="Apply starting capital and reset portfolio"
+              style={{
+                background: THEME.gold,
+                color: '#1A1508',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '8px 14px',
+                fontFamily: FONT_SANS,
+                fontSize: '13px',
+                fontWeight: 500,
+                cursor: 'pointer',
+              }}
+            >
+              Apply &amp; reset portfolio
+            </button>
+            <span
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: '11px',
+                color: THEME.goldBright,
+                background: THEME.panel,
+                border: `1px solid ${THEME.hairline}`,
+                borderRadius: '4px',
+                padding: '6px 10px',
+              }}
+            >
+              {accountTier.name} account
+            </span>
+          </div>
+          <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '20px' }}>
+            {accountTier.description} Position sizing is capped at{' '}
+            {(accountTier.positionCapMultiplier * 100).toFixed(0)}% of the risk preset&apos;s
+            normal size, entries need a{' '}
+            {accountTier.thresholdBump >= 0 ? 'stricter' : 'slightly looser'} signal (
+            {accountTier.thresholdBump >= 0 ? '+' : ''}
+            {accountTier.thresholdBump.toFixed(2)} threshold), and{' '}
+            {(accountTier.reserveFloorPct * 100).toFixed(0)}% of starting capital (
+            ${fmtUSD(Math.max(startCash * accountTier.reserveFloorPct, 0.01))}) is always kept
+            in reserve, untouched by any single trade. Changing this resets the portfolio.
+          </div>
+
           <div
             style={{
               display: 'flex',
@@ -1011,7 +1302,7 @@ export default function AurumTerminal() {
           {botRunning ? 'Pause bot' : 'Start bot'}
         </button>
         <button
-          onClick={handleReset}
+          onClick={() => handleReset()}
           aria-label="Reset portfolio to initial state"
           style={{
             display: 'flex',
@@ -1069,6 +1360,22 @@ export default function AurumTerminal() {
             </option>
           ))}
         </select>
+        <span
+          title={accountTier.description}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            fontFamily: FONT_MONO,
+            fontSize: '12px',
+            color: THEME.muted,
+            border: `1px solid ${THEME.hairline}`,
+            borderRadius: '6px',
+            padding: '8px 12px',
+          }}
+        >
+          <Target size={13} /> {accountTier.name} &middot; ${fmtUSD(startCash, 0)}
+        </span>
         <button
           onClick={() => setMathOnly((m) => !m)}
           aria-label={mathOnly ? 'Enable LLM news analysis' : 'Use math-only mode'}
@@ -1105,7 +1412,7 @@ export default function AurumTerminal() {
           { label: 'Cash', value: `$${fmtUSD(portfolio.cash)}` },
           {
             label: 'Gold held',
-            value: `${portfolio.oz.toFixed(4)} oz`,
+            value: `${fmtOz(portfolio.oz)} oz`,
           },
           {
             label: 'P&L',
@@ -1180,7 +1487,7 @@ export default function AurumTerminal() {
             OPEN POSITION
           </span>
           <span style={{ color: THEME.muted }}>
-            Long {portfolio.oz.toFixed(4)} oz @ ${fmtUSD(portfolio.entryPrice)}
+            Long {fmtOz(portfolio.oz)} oz @ ${fmtUSD(portfolio.entryPrice)}
           </span>
           {openPositionPnlPct != null && (
             <span
@@ -1203,7 +1510,12 @@ export default function AurumTerminal() {
             }}
           >
             <Shield size={12} /> SL ${fmtUSD(portfolio.slPrice)}
-            {portfolio.beActive && ' (BE)'}
+            {portfolio.beActive &&
+              (portfolio.slPrice != null &&
+              portfolio.entryPrice != null &&
+              portfolio.slPrice > portfolio.entryPrice
+                ? ' (trailing)'
+                : ' (BE)')}
           </span>
           <span
             style={{
@@ -1281,6 +1593,11 @@ export default function AurumTerminal() {
               MACD {macd != null ? (macd > 0 ? '+' : '') + fmtUSD(macd, 3) : '--'}
             </span>
             <span>BBW {bbWidth != null ? bbWidth.toFixed(2) + '%' : '--'}</span>
+            <span>
+              Trend {regression ? (regression.slopePct > 0 ? '+' : '') + regression.slopePct.toFixed(3) + '%/bar' : '--'}
+              {regression ? ` (R² ${regression.r2.toFixed(2)})` : ''}
+            </span>
+            <span>Z-score {meanReversionZ != null ? meanReversionZ.toFixed(2) : '--'}</span>
           </div>
         </div>
 
@@ -1356,6 +1673,12 @@ export default function AurumTerminal() {
                   <span style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted }}>
                     score {news.sentiment_score.toFixed(2)}
                   </span>
+                  <span style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted }}>
+                    conf {(news.confidence * 100).toFixed(0)}%
+                  </span>
+                  <span style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted }}>
+                    · weighted {effectiveSentiment.toFixed(2)}
+                  </span>
                 </div>
                 <p style={{ fontSize: '13px', lineHeight: 1.5, margin: '0 0 10px' }}>
                   {news.summary}
@@ -1384,6 +1707,317 @@ export default function AurumTerminal() {
                 </div>
               </>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* Quant Signal + Performance Stats */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+          gap: '16px',
+          marginBottom: '16px',
+        }}
+      >
+        <div
+          style={{
+            background: THEME.panel,
+            border: `1px solid ${THEME.hairline}`,
+            borderRadius: '8px',
+            padding: '14px',
+          }}
+        >
+          <div
+            style={{
+              fontSize: '12px',
+              color: THEME.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              marginBottom: '10px',
+            }}
+          >
+            Quant signal
+          </div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', marginBottom: '8px' }}>
+            <span
+              style={{
+                fontFamily: FONT_SERIF,
+                fontSize: '26px',
+                color: currentWinProbability >= 0.5 ? THEME.gain : THEME.loss,
+              }}
+            >
+              {(currentWinProbability * 100).toFixed(0)}%
+            </span>
+            <span style={{ fontSize: '11px', color: THEME.muted }}>
+              calibrated up-probability (sigmoid of composite score, not a guarantee)
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '6px 12px',
+              fontFamily: FONT_MONO,
+              fontSize: '11px',
+              color: THEME.muted,
+            }}
+          >
+            <span>Technical score {currentTechScore >= 0 ? '+' : ''}{currentTechScore.toFixed(3)}</span>
+            <span>Composite {currentCombinedScore >= 0 ? '+' : ''}{currentCombinedScore.toFixed(3)}</span>
+            <span>News weight {(newsAgeWeight * 100).toFixed(0)}%</span>
+            <span>
+              Kelly size {currentKelly != null ? (currentKelly * 100).toFixed(1) + '%' : 'n/a (needs 8+ trades)'}
+            </span>
+          </div>
+        </div>
+
+        <div
+          style={{
+            background: THEME.panel,
+            border: `1px solid ${THEME.hairline}`,
+            borderRadius: '8px',
+            padding: '14px',
+          }}
+        >
+          <div
+            style={{
+              fontSize: '12px',
+              color: THEME.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              marginBottom: '10px',
+            }}
+          >
+            Performance stats &middot; {tradeStats.totalTrades} closed trades
+          </div>
+          {tradeStats.totalTrades === 0 ? (
+            <div style={{ fontSize: '12px', color: THEME.muted }}>
+              No closed trades yet &mdash; stats populate after the first round-trip.
+            </div>
+          ) : (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr 1fr',
+                gap: '6px 12px',
+                fontFamily: FONT_MONO,
+                fontSize: '11px',
+                color: THEME.muted,
+              }}
+            >
+              <span>Win rate {(tradeStats.winRate * 100).toFixed(0)}%</span>
+              <span>
+                Expectancy{' '}
+                <span style={{ color: tradeStats.expectancyPct >= 0 ? THEME.gain : THEME.loss }}>
+                  {tradeStats.expectancyPct >= 0 ? '+' : ''}
+                  {tradeStats.expectancyPct.toFixed(2)}%
+                </span>
+              </span>
+              <span>
+                Profit factor{' '}
+                {tradeStats.profitFactor == null
+                  ? '--'
+                  : tradeStats.profitFactor === Infinity
+                    ? '∞'
+                    : tradeStats.profitFactor.toFixed(2)}
+              </span>
+              <span>Avg win/loss +{tradeStats.avgWinPct.toFixed(2)}% / -{tradeStats.avgLossPct.toFixed(2)}%</span>
+              <span>Sharpe {tradeStats.sharpe != null ? tradeStats.sharpe.toFixed(2) : '--'}</span>
+              <span>Sortino {tradeStats.sortino != null ? tradeStats.sortino.toFixed(2) : '--'}</span>
+              <span style={{ gridColumn: '1 / -1' }}>
+                Max drawdown{' '}
+                <span style={{ color: THEME.loss }}>
+                  {tradeStats.maxDrawdownPct != null ? tradeStats.maxDrawdownPct.toFixed(2) : '--'}%
+                </span>{' '}
+                (cumulative closed-trade PnL%)
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Market Memory / Brain */}
+      <div
+        style={{
+          background: THEME.panel,
+          border: `1px solid ${THEME.hairline}`,
+          borderRadius: '8px',
+          padding: '14px',
+          marginBottom: '16px',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            fontSize: '12px',
+            color: THEME.muted,
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+            marginBottom: '12px',
+          }}
+        >
+          <Brain size={13} /> Market memory &middot; learned from{' '}
+          {tradeStats.totalTrades} closed trade{tradeStats.totalTrades === 1 ? '' : 's'}
+        </div>
+
+        {/* Day / Week / Month trend badges */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+            gap: '10px',
+            marginBottom: '14px',
+          }}
+        >
+          {[
+            { label: 'Today', trend: dayTrend },
+            { label: 'This week', trend: weekTrend },
+            { label: 'This month', trend: monthTrend },
+          ].map(({ label, trend }) => (
+            <div
+              key={label}
+              style={{
+                background: THEME.panelAlt,
+                border: `1px solid ${THEME.hairline}`,
+                borderRadius: '6px',
+                padding: '10px 12px',
+              }}
+            >
+              <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '4px' }}>
+                {label}
+              </div>
+              {trend ? (
+                <>
+                  <div
+                    style={{
+                      fontFamily: FONT_MONO,
+                      fontSize: '15px',
+                      color: trend.changePct >= 0 ? THEME.gain : THEME.loss,
+                    }}
+                  >
+                    {trend.changePct >= 0 ? '+' : ''}
+                    {trend.changePct.toFixed(2)}%
+                  </div>
+                  <div style={{ fontSize: '10px', color: THEME.muted }}>
+                    {trend.r2 >= 0.3
+                      ? trend.slopePct > 0
+                        ? 'Trending up'
+                        : 'Trending down'
+                      : 'Choppy / range-bound'}{' '}
+                    &middot; {trend.points} pts
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: '11px', color: THEME.muted }}>Not enough data yet</div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Current regime + learned win rate */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            marginBottom: '10px',
+            flexWrap: 'wrap',
+          }}
+        >
+          <span style={{ fontSize: '11px', color: THEME.muted }}>Current condition:</span>
+          <span
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: '12px',
+              color: THEME.goldBright,
+              background: THEME.panelAlt,
+              border: `1px solid ${THEME.hairline}`,
+              borderRadius: '4px',
+              padding: '3px 8px',
+            }}
+          >
+            {currentRegimeStr}
+          </span>
+          {currentRegimeStat ? (
+            <span
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: '11px',
+                color: currentRegimeStat.winRate >= 0.5 ? THEME.gain : THEME.loss,
+              }}
+            >
+              {(currentRegimeStat.winRate * 100).toFixed(0)}% win rate over{' '}
+              {currentRegimeStat.trades} past trade{currentRegimeStat.trades === 1 ? '' : 's'}
+            </span>
+          ) : (
+            <span style={{ fontSize: '11px', color: THEME.muted }}>
+              no history yet in this exact condition
+            </span>
+          )}
+        </div>
+
+        {/* Learned regime table */}
+        {regimeStatsAll.length > 0 ? (
+          <div style={{ maxHeight: '180px', overflowY: 'auto', overflowX: 'auto' }}>
+            <table
+              style={{
+                width: '100%',
+                minWidth: '480px',
+                borderCollapse: 'collapse',
+                fontSize: '11px',
+                fontFamily: FONT_MONO,
+              }}
+            >
+              <thead>
+                <tr style={{ color: THEME.muted, textAlign: 'left' }}>
+                  <th style={{ padding: '4px 6px', fontWeight: 400 }}>Learned condition</th>
+                  <th style={{ padding: '4px 6px', fontWeight: 400 }}>Trades</th>
+                  <th style={{ padding: '4px 6px', fontWeight: 400 }}>Win rate</th>
+                  <th style={{ padding: '4px 6px', fontWeight: 400 }}>Avg PnL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {regimeStatsAll.slice(0, 10).map((s) => (
+                  <tr
+                    key={s.regime}
+                    style={{
+                      borderTop: `1px solid ${THEME.hairline}`,
+                      background:
+                        s.regime === currentRegimeStr ? 'rgba(198,161,91,0.08)' : 'transparent',
+                    }}
+                  >
+                    <td style={{ padding: '4px 6px', color: THEME.text }}>{s.regime}</td>
+                    <td style={{ padding: '4px 6px', color: THEME.muted }}>{s.trades}</td>
+                    <td
+                      style={{
+                        padding: '4px 6px',
+                        color: s.winRate >= 0.5 ? THEME.gain : THEME.loss,
+                      }}
+                    >
+                      {(s.winRate * 100).toFixed(0)}%
+                    </td>
+                    <td
+                      style={{
+                        padding: '4px 6px',
+                        color: s.avgPnlPct >= 0 ? THEME.gain : THEME.loss,
+                      }}
+                    >
+                      {s.avgPnlPct >= 0 ? '+' : ''}
+                      {s.avgPnlPct.toFixed(2)}%
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div style={{ fontSize: '11px', color: THEME.muted }}>
+            The brain builds this table from the bot&apos;s own closed paper trades &mdash; once
+            it has 6-8+ trades in a given condition it starts nudging entries toward setups that
+            have worked and away from (or outright skipping) ones that haven&apos;t.
           </div>
         )}
       </div>
@@ -1516,7 +2150,7 @@ export default function AurumTerminal() {
               </div>
               <div style={{ textAlign: 'right', flexShrink: 0 }}>
                 <div style={{ fontFamily: FONT_MONO, fontSize: '12px' }}>
-                  {t.oz.toFixed(4)} oz @ ${fmtUSD(t.price)}
+                  {fmtOz(t.oz)} oz @ ${fmtUSD(t.price)}
                 </div>
                 {typeof t.pnl === 'number' && (
                   <div

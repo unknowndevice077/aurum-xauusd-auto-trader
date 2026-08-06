@@ -74,8 +74,7 @@ const PROVIDERS: Record<
     }),
     extractText: (data: unknown) => {
       const d = data as { content?: Array<{ type: string; text: string }> };
-      return (d.content || []).map((b) => (b.type === 'text' ? b.text : '')).filter(Boolean).join('
-');
+      return (d.content || []).map((b) => (b.type === 'text' ? b.text : '')).filter(Boolean).join('\n');
     },
   },
   openai: {
@@ -134,14 +133,15 @@ const PROVIDERS: Record<
 
 const SYSTEM_WITH_SEARCH =
   'Gold market analyst. Web-search news from last 24-48h affecting XAU/USD (dollar strength, Fed, inflation, yields). ' +
+  'Also self-rate how confident you are in this read (1.0 = strong, unambiguous consensus across sources; 0.2 = thin, stale, or conflicting signals). ' +
   'Reply with ONLY raw JSON, no markdown, no preamble: ' +
-  '{"sentiment_score":-1to1,"bias":"bullish|bearish|neutral","summary":"<20 words","key_driver":"<6 words"}';
+  '{"sentiment_score":-1to1,"confidence":0to1,"bias":"bullish|bearish|neutral","summary":"<20 words","key_driver":"<6 words"}';
 
 const SYSTEM_NO_SEARCH =
   'Gold market analyst. Based on your general knowledge of typical XAU/USD drivers (dollar strength, Fed policy, inflation, yields), ' +
-  'give a plausible current-conditions style estimate. ' +
+  'give a plausible current-conditions style estimate. Since this is NOT live search, self-rate confidence low-to-moderate (0.2-0.5) unless the macro backdrop is unusually clear-cut. ' +
   'Reply with ONLY raw JSON, no markdown, no preamble: ' +
-  '{"sentiment_score":-1to1,"bias":"bullish|bearish|neutral","summary":"<20 words","key_driver":"<6 words"}';
+  '{"sentiment_score":-1to1,"confidence":0to1,"bias":"bullish|bearish|neutral","summary":"<20 words","key_driver":"<6 words"}';
 
 export async function POST(req: NextRequest) {
   try {
@@ -206,11 +206,23 @@ export async function POST(req: NextRequest) {
     const data = await upstream.json();
     const text = provider.extractText(data);
     const clean = text.replace(/```json|```/g, '').trim();
-    const match = clean.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : clean);
+    
+    let parsed: any;
+    try {
+      const match = clean.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(match ? match[0] : clean);
+    } catch (e) {
+      return NextResponse.json(
+        { error: 'Failed to parse JSON response from LLM.', llm_response: clean },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json({
       sentiment_score: Math.max(-1, Math.min(1, Number(parsed.sentiment_score) || 0)),
+      confidence: Number.isFinite(Number(parsed.confidence))
+        ? Math.max(0, Math.min(1, Number(parsed.confidence)))
+        : 0.5,
       bias: parsed.bias || 'neutral',
       summary: parsed.summary || '',
       key_driver: parsed.key_driver || '',

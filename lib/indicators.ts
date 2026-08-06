@@ -166,7 +166,9 @@ export function technicalScore(
   macdSignal: number | null,
   atr: number | null,
   bbWidth: number | null,
-  prices: number[]
+  prices: number[],
+  regression?: { slopePct: number; r2: number } | null,
+  meanReversionZ?: number | null
 ) {
   if (ema12 == null || ema26 == null || rsi == null) return 0;
 
@@ -204,6 +206,24 @@ export function technicalScore(
     const roc = (price - prices[prices.length - 4]) / prices[prices.length - 4];
     const rocScore = Math.max(-0.15, Math.min(0.15, roc * 20));
     score += rocScore;
+  }
+
+  // 7. Least-squares trend regression — confirms direction with a
+  // noise-resistant slope, weighted by how clean the trend is (R²).
+  // A steep, high-R² trend adds conviction; a flat/choppy fit contributes
+  // almost nothing.
+  if (regression) {
+    const slopeScore = Math.max(-0.2, Math.min(0.2, regression.slopePct * regression.r2 * 4));
+    score += slopeScore;
+  }
+
+  // 8. Mean-reversion guardrail — when price is statistically stretched
+  // (|z| > 2 standard deviations from its rolling mean) fade some
+  // conviction, since stretched moves in gold tend to snap back rather
+  // than extend indefinitely.
+  if (meanReversionZ != null && Math.abs(meanReversionZ) > 2) {
+    const stretch = Math.min(1, (Math.abs(meanReversionZ) - 2) / 2); // 0 at z=2, 1 at z=4+
+    score -= Math.sign(score) * stretch * 0.3;
   }
 
   return Math.max(-1, Math.min(1, score));
