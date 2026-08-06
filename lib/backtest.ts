@@ -14,7 +14,18 @@
 //     backtested, so this always runs in math-only (technical + brain) mode.
 
 import { computeIndicators, technicalScore, calculatePositionSize } from './indicators';
-import { linearRegression, zScore, kellyFraction, computeTradeStats, type TradeStats } from './quant';
+import {
+  linearRegression,
+  zScore,
+  kellyFraction,
+  computeTradeStats,
+  maxDrawdownFromEquityCurve,
+  annualizedRiskStats,
+  winRateConfidenceInterval,
+  detectPriceAnomalies,
+  type TradeStats,
+  type PriceAnomaly,
+} from './quant';
 import {
   classifyRegime,
   regimeKey,
@@ -35,23 +46,38 @@ export type BacktestResult = {
   finalEquity: number;
   totalReturnPct: number;
   stats: TradeStats;
+  winRateCI: { low: number; high: number } | null;
+  anomalies: PriceAnomaly[]; // unusually large single-bar moves in the input data — disclosed, not altered
   barsTraded: number;
   dateRange: { from: number; to: number } | null;
 };
 
 export function runBacktest(
   history: { t: number; p: number }[],
-  opts: { riskKey: RiskPresetKey | string; startCash: number }
+  opts: { riskKey: RiskPresetKey | string; startCash: number; from?: number; to?: number }
 ): BacktestResult | null {
   const preset = RISK_PRESETS[opts.riskKey];
   if (!preset) return null;
 
-  const points = history
+  const allPoints = history
     .filter(
       (pt) => pt && typeof pt.t === 'number' && typeof pt.p === 'number' && !isNaN(pt.t) && !isNaN(pt.p)
     )
     .sort((a, b) => a.t - b.t);
+
+  // Respect an optional end date (never look past it), but keep real
+  // preceding history for indicator warmup even when a mid-range start
+  // date is chosen — starting a 20/50-bar indicator cold exactly at the
+  // user's chosen window boundary would bias the first few signals.
+  const points = opts.to != null ? allPoints.filter((pt) => pt.t <= opts.to!) : allPoints;
   if (points.length < WARMUP_BARS + 5) return null;
+
+  const rangeStartIdx =
+    opts.from != null ? points.findIndex((pt) => pt.t >= opts.from!) : WARMUP_BARS;
+  const startIdx = Math.max(WARMUP_BARS, rangeStartIdx === -1 ? points.length : rangeStartIdx);
+  if (startIdx >= points.length) return null;
+
+  const anomalies = detectPriceAnomalies(points.slice(Math.max(0, startIdx - WARMUP_BARS)));
 
   const tier = getAccountTier(opts.startCash);
   const reserveFloor = Math.max(opts.startCash * tier.reserveFloorPct, 0.01);
@@ -72,7 +98,7 @@ export function runBacktest(
   const trades: Trade[] = [];
   const equityCurve: { t: number; value: number }[] = [];
 
-  for (let i = WARMUP_BARS; i < points.length; i++) {
+  for (let i = startIdx; i < points.length; i++) {
     const prices = points.slice(0, i + 1).map((pt) => pt.p);
     const price = prices[prices.length - 1];
     const ts = points[i].t;
@@ -217,7 +243,26 @@ export function runBacktest(
   const finalEquity = cash + oz * finalPrice;
   const totalReturnPct = ((finalEquity - opts.startCash) / opts.startCash) * 100;
   const tradesDesc = [...trades].reverse(); // newest-first, matches live ledger
-  const stats = computeTradeStats(tradesDesc);
+
+  // Win rate / avg win-loss / profit factor / expectancy come from the
+  // per-trade stats as before (those are correctly per-trade metrics).
+  // Sharpe, Sortino, and max drawdown are recomputed from the real $
+  // equity curve instead — computeTradeStats' version of those three
+  // approximates via summed trade %, which misstates drawdown whenever
+  // position size varies between trades (it does here, under Kelly/tier
+  // sizing) and isn't annualized.
+  const tradeStats = computeTradeStats(tradesDesc);
+  const { sharpe, sortino } = annualizedRiskStats(equityCurve);
+  const stats: TradeStats = {
+    ...tradeStats,
+    sharpe,
+    sortino,
+    maxDrawdownPct: maxDrawdownFromEquityCurve(equityCurve),
+  };
+
+  const closedCount = tradesDesc.filter((t) => typeof t.pnlPct === 'number').length;
+  const wins = tradesDesc.filter((t) => typeof t.pnlPct === 'number' && (t.pnlPct as number) > 0).length;
+  const winRateCI = winRateConfidenceInterval(wins, closedCount);
 
   return {
     trades: tradesDesc,
@@ -226,10 +271,9 @@ export function runBacktest(
     finalEquity,
     totalReturnPct,
     stats,
-    barsTraded: points.length - WARMUP_BARS,
-    dateRange:
-      points.length > WARMUP_BARS
-        ? { from: points[WARMUP_BARS].t, to: points[points.length - 1].t }
-        : null,
+    winRateCI,
+    anomalies,
+    barsTraded: points.length - startIdx,
+    dateRange: points.length > startIdx ? { from: points[startIdx].t, to: points[points.length - 1].t } : null,
   };
 }

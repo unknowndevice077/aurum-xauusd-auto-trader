@@ -126,6 +126,7 @@ export default function AurumTerminal() {
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
   const [backtestRunning, setBacktestRunning] = useState(false);
   const [backtestError, setBacktestError] = useState('');
+  const [backtestYear, setBacktestYear] = useState('all'); // 'all' or a 4-digit calendar year string
   const [botRunning, setBotRunning] = useState(false);
   const [riskKey, setRiskKey] = useState('balanced');
   const [mathOnly, setMathOnly] = useState(true);
@@ -285,7 +286,7 @@ export default function AurumTerminal() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch('/api/history');
+        const res = await fetch('/api/history?range=1y');
         const json = await res.json();
         if (!res.ok || !json.points?.length) throw new Error(json.error || 'no history');
         const points: { t: number; p: number }[] = json.points;
@@ -328,16 +329,17 @@ export default function AurumTerminal() {
     };
   }, [loaded]);
 
-  // ─── Daily History (for week/month market memory) ──────────────────────
+  // ─── Daily History (for week/month market memory + backtest year picker) ─
   // Fetched independently of the resumed-session check above so the
   // monitoring panel always has real week/month context, even when the live
-  // tick buffer was restored from localStorage.
+  // tick buffer was restored from localStorage. Requests the full available
+  // range (not just 1y) so the backtest can offer a real year selector.
   useEffect(() => {
     if (!loaded) return;
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch('/api/history');
+        const res = await fetch('/api/history?range=max');
         const json = await res.json();
         if (!cancelled && !json.error && Array.isArray(json.points) && json.points.length > 0) {
           setDailyHistory(json.points);
@@ -804,9 +806,20 @@ export default function AurumTerminal() {
     // (synchronous, fast) backtest loop runs.
     setTimeout(() => {
       try {
-        const result = runBacktest(dailyHistory, { riskKey, startCash });
+        let from: number | undefined;
+        let to: number | undefined;
+        if (backtestYear !== 'all') {
+          const year = parseInt(backtestYear, 10);
+          from = Math.floor(new Date(Date.UTC(year, 0, 1)).getTime() / 1000);
+          to = Math.floor(new Date(Date.UTC(year + 1, 0, 1)).getTime() / 1000) - 1;
+        }
+        const result = runBacktest(dailyHistory, { riskKey, startCash, from, to });
         if (!result) {
-          setBacktestError('Not enough historical data to backtest (need 55+ daily bars).');
+          setBacktestError(
+            backtestYear !== 'all'
+              ? `Not enough historical data in ${backtestYear} to backtest (need 55+ daily bars).`
+              : 'Not enough historical data to backtest (need 55+ daily bars).'
+          );
           setBacktestResult(null);
         } else {
           setBacktestResult(result);
@@ -817,7 +830,15 @@ export default function AurumTerminal() {
         setBacktestRunning(false);
       }
     }, 10);
-  }, [dailyHistory, riskKey, startCash]);
+  }, [dailyHistory, riskKey, startCash, backtestYear]);
+
+  const availableBacktestYears = useMemo(() => {
+    const years = new Set<number>();
+    for (const pt of dailyHistory) {
+      years.add(new Date(pt.t * 1000).getUTCFullYear());
+    }
+    return Array.from(years).sort((a, b) => b - a);
+  }, [dailyHistory]);
 
   const handleResetChart = useCallback(() => {
     setPriceHistory([]);
@@ -2051,39 +2072,68 @@ export default function AurumTerminal() {
               letterSpacing: '0.04em',
             }}
           >
-            <History size={13} /> Backtest &middot; 1-year daily history
+            <History size={13} /> Backtest &middot; real GC=F daily history
           </span>
-          <button
-            onClick={handleRunBacktest}
-            disabled={backtestRunning || dailyHistory.length === 0}
-            aria-label="Run backtest against 1-year historical data"
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              background: THEME.gold,
-              color: '#1A1508',
-              border: 'none',
-              borderRadius: '6px',
-              padding: '8px 14px',
-              fontFamily: FONT_SANS,
-              fontSize: '13px',
-              fontWeight: 500,
-              cursor: backtestRunning || dailyHistory.length === 0 ? 'not-allowed' : 'pointer',
-              opacity: backtestRunning || dailyHistory.length === 0 ? 0.6 : 1,
-            }}
-          >
-            {backtestRunning ? <Loader2 size={14} className="spin" /> : <History size={14} />}
-            {backtestRunning ? 'Running…' : 'Run backtest'}
-          </button>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <select
+              value={backtestYear}
+              onChange={(e) => setBacktestYear(e.target.value)}
+              aria-label="Backtest year"
+              style={{
+                background: THEME.panelAlt,
+                color: THEME.text,
+                border: `1px solid ${THEME.hairline}`,
+                borderRadius: '6px',
+                padding: '8px 10px',
+                fontFamily: FONT_MONO,
+                fontSize: '12px',
+              }}
+            >
+              <option value="all">All available history</option>
+              {availableBacktestYears.map((y) => (
+                <option key={y} value={String(y)}>
+                  {y}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={handleRunBacktest}
+              disabled={backtestRunning || dailyHistory.length === 0}
+              aria-label="Run backtest"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                background: THEME.gold,
+                color: '#1A1508',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '8px 14px',
+                fontFamily: FONT_SANS,
+                fontSize: '13px',
+                fontWeight: 500,
+                cursor: backtestRunning || dailyHistory.length === 0 ? 'not-allowed' : 'pointer',
+                opacity: backtestRunning || dailyHistory.length === 0 ? 0.6 : 1,
+              }}
+            >
+              {backtestRunning ? <Loader2 size={14} className="spin" /> : <History size={14} />}
+              {backtestRunning ? 'Running…' : 'Run backtest'}
+            </button>
+          </div>
         </div>
         <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '12px' }}>
           Replays the same strategy (technical scoring, account-tier sizing, Kelly sizing, the
           regime brain, breakeven &amp; trailing stop) against real historical GC=F daily closes,
           using the current <strong style={{ color: THEME.text }}>{RISK_PRESETS[riskKey]?.label}</strong>{' '}
           preset and <strong style={{ color: THEME.text }}>${fmtUSD(startCash, 0)}</strong> starting
-          capital. Two honest limits: stop/take-profit checks use daily closes, not intraday highs
-          and lows, and there&apos;s no historical news feed, so this always runs math-only.
+          capital, over{' '}
+          <strong style={{ color: THEME.text }}>
+            {backtestYear === 'all' ? 'all available history' : backtestYear}
+          </strong>
+          . Two honest limits: stop/take-profit checks use daily closes, not intraday highs and
+          lows, and there&apos;s no historical news feed, so this always runs math-only. A single
+          position at a time plus a selective entry threshold naturally means low trade counts —
+          this is a patient, one-position system, not a high-frequency one.
         </div>
 
         {backtestError && (
@@ -2110,9 +2160,15 @@ export default function AurumTerminal() {
                 },
                 { label: 'Final equity', value: `$${fmtUSD(backtestResult.finalEquity)}` },
                 { label: 'Trades', value: `${backtestResult.stats.totalTrades}` },
-                { label: 'Win rate', value: `${(backtestResult.stats.winRate * 100).toFixed(0)}%` },
                 {
-                  label: 'Sharpe',
+                  label: 'Win rate',
+                  value: `${(backtestResult.stats.winRate * 100).toFixed(0)}%`,
+                  sub: backtestResult.winRateCI
+                    ? `95% CI ${(backtestResult.winRateCI.low * 100).toFixed(0)}–${(backtestResult.winRateCI.high * 100).toFixed(0)}%`
+                    : undefined,
+                },
+                {
+                  label: 'Sharpe (ann.)',
                   value: backtestResult.stats.sharpe != null ? backtestResult.stats.sharpe.toFixed(2) : '--',
                 },
                 {
@@ -2145,9 +2201,63 @@ export default function AurumTerminal() {
                   >
                     {kpi.value}
                   </div>
+                  {kpi.sub && (
+                    <div style={{ fontFamily: FONT_MONO, fontSize: '10px', color: THEME.muted }}>
+                      {kpi.sub}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
+
+            {backtestResult.stats.totalTrades > 0 && backtestResult.stats.totalTrades < 30 && (
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: THEME.muted,
+                  background: THEME.panelAlt,
+                  border: `1px solid ${THEME.hairline}`,
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  marginBottom: '10px',
+                }}
+              >
+                Only {backtestResult.stats.totalTrades} trades &mdash; below ~30, win rate/Sharpe
+                are not statistically reliable (see the win rate&apos;s wide confidence interval
+                above). Treat these numbers as a rough signal, not a verdict.
+              </div>
+            )}
+
+            {backtestResult.anomalies.length > 0 && (
+              <div
+                style={{
+                  fontSize: '11px',
+                  color: THEME.muted,
+                  background: THEME.panelAlt,
+                  border: `1px solid ${THEME.gold}`,
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  marginBottom: '10px',
+                }}
+              >
+                <strong style={{ color: THEME.text }}>
+                  {backtestResult.anomalies.length} unusually large single-day move
+                  {backtestResult.anomalies.length === 1 ? '' : 's'} in this data
+                </strong>{' '}
+                (&gt;8% in a day &mdash; larger than gold has moved in one real session even
+                during 2008 or 2020): {backtestResult.anomalies.slice(0, 5).map((a, i) => (
+                  <span key={a.t}>
+                    {i > 0 ? ', ' : ''}
+                    {new Date(a.t * 1000).toLocaleDateString()} ({a.changePct >= 0 ? '+' : ''}
+                    {a.changePct.toFixed(1)}%)
+                  </span>
+                ))}
+                {backtestResult.anomalies.length > 5 ? '…' : ''}. Could be a real move or an
+                artifact of Yahoo&apos;s free GC=F feed not being adjusted for futures contract
+                rollovers &mdash; shown here rather than silently altered, since telling the two
+                apart from price alone isn&apos;t reliable.
+              </div>
+            )}
 
             {backtestResult.dateRange && (
               <div style={{ fontSize: '10px', color: THEME.muted, marginBottom: '10px' }}>

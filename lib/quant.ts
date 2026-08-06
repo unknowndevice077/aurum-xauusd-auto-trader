@@ -199,6 +199,128 @@ export function computeTradeStats(trades: Trade[]): TradeStats {
   };
 }
 
+// ─── Equity-Curve-Based Risk Stats (the correct way) ───────────────────────
+// computeTradeStats() above approximates Sharpe/Sortino/max-drawdown by
+// summing per-trade % returns — that's a real inaccuracy: it misstates
+// drawdown whenever position size varies between trades (which it does,
+// under Kelly/account-tier sizing), and per-trade returns aren't a
+// portfolio return series (irregular spacing, not annualized, so the
+// Sharpe number isn't comparable to any standard benchmark). When a real
+// $ equity curve is available (the backtest always has one), use these
+// instead — this is the textbook definition (Sharpe, "The Sharpe Ratio",
+// Journal of Portfolio Management, 1994).
+
+// Peak-to-trough decline of actual portfolio value — the standard
+// definition of max drawdown, not an approximation.
+export function maxDrawdownFromEquityCurve(
+  curve: { t: number; value: number }[]
+): number | null {
+  if (curve.length < 2) return null;
+  let peak = curve[0].value;
+  let maxDd = 0;
+  for (const pt of curve) {
+    peak = Math.max(peak, pt.value);
+    if (peak > 0) {
+      maxDd = Math.min(maxDd, ((pt.value - peak) / peak) * 100);
+    }
+  }
+  return maxDd;
+}
+
+// Infers how many equity-curve samples make up a year from the curve's own
+// average spacing, so this works whether the curve is daily backtest bars,
+// 4s local-sim ticks, or 1-5min server cron ticks, without hardcoding.
+function inferPeriodsPerYear(curve: { t: number; value: number }[]): number {
+  if (curve.length < 3) return 252;
+  let totalSpan = 0;
+  for (let i = 1; i < curve.length; i++) totalSpan += curve[i].t - curve[i - 1].t;
+  const avgSpacing = totalSpan / (curve.length - 1);
+  if (avgSpacing <= 0) return 252;
+  const secondsPerYear = 365.25 * 86400;
+  // curve.t may be in seconds (backtest) or ms (live/server) — spacing
+  // under ~1e6 is almost certainly seconds-based (bars are days apart at
+  // most in the seconds case), otherwise treat as milliseconds.
+  const spacingSeconds = avgSpacing > 1e6 ? avgSpacing / 1000 : avgSpacing;
+  return Math.max(1, secondsPerYear / spacingSeconds);
+}
+
+export function annualizedRiskStats(
+  curve: { t: number; value: number }[],
+  periodsPerYear?: number
+): { sharpe: number | null; sortino: number | null } {
+  if (curve.length < 3) return { sharpe: null, sortino: null };
+  const returns: number[] = [];
+  for (let i = 1; i < curve.length; i++) {
+    const prev = curve[i - 1].value;
+    if (prev > 0) returns.push((curve[i].value - prev) / prev);
+  }
+  if (returns.length < 2) return { sharpe: null, sortino: null };
+
+  const n = periodsPerYear ?? inferPeriodsPerYear(curve);
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => a + (b - mean) ** 2, 0) / returns.length;
+  const sd = Math.sqrt(variance);
+  const sharpe = sd > 0 ? (mean / sd) * Math.sqrt(n) : null;
+
+  const downside = returns.filter((r) => r < 0);
+  const downsideVariance = downside.length
+    ? downside.reduce((a, b) => a + b ** 2, 0) / downside.length
+    : 0;
+  const downsideSd = Math.sqrt(downsideVariance);
+  const sortino = downsideSd > 0 ? (mean / downsideSd) * Math.sqrt(n) : null;
+
+  return { sharpe, sortino };
+}
+
+// ─── Win-Rate Confidence Interval ──────────────────────────────────────────
+// A raw win rate like "40% over 10 trades" implies false precision — the
+// Wilson score interval (Wilson, 1927; standard practice over the naive
+// normal approximation because it stays well-behaved at small n / extreme
+// p) gives an honest range. At n=10, a 40% win rate's 95% CI is roughly
+// [16%, 68%] — i.e. not statistically distinguishable from a coin flip.
+export function winRateConfidenceInterval(
+  wins: number,
+  total: number,
+  z: number = 1.96
+): { low: number; high: number } | null {
+  if (total === 0) return null;
+  const p = wins / total;
+  const denom = 1 + (z * z) / total;
+  const center = p + (z * z) / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total));
+  return {
+    low: Math.max(0, (center - margin) / denom),
+    high: Math.min(1, (center + margin) / denom),
+  };
+}
+
+// ─── Data Quality: Anomalous Single-Bar Moves ──────────────────────────────
+// Free retail data feeds (this app uses Yahoo Finance's GC=F continuous
+// futures symbol) can contain single-bar moves that don't reflect real
+// intraday-continuous trading — most commonly from unadjusted futures
+// contract rollovers (Yahoo doesn't back-adjust GC=F for the roll), or
+// occasionally a bad tick. This does NOT silently alter the data — it only
+// flags bars for transparent disclosure, since telling a real crash apart
+// from a feed artifact with certainty isn't possible from price alone.
+export type PriceAnomaly = { t: number; changePct: number };
+
+export function detectPriceAnomalies(
+  prices: { t: number; p: number }[],
+  maxSaneMovePct: number = 8
+): PriceAnomaly[] {
+  const anomalies: PriceAnomaly[] = [];
+  for (let i = 1; i < prices.length; i++) {
+    const prev = prices[i - 1].p;
+    const cur = prices[i].p;
+    if (prev <= 0) continue;
+    const changePct = ((cur - prev) / prev) * 100;
+    if (Math.abs(changePct) > maxSaneMovePct) {
+      anomalies.push({ t: prices[i].t, changePct });
+    }
+  }
+  return anomalies;
+}
+
 // ─── Kelly Criterion ─────────────────────────────────────────────────────
 // f* = W - (1-W)/R, where W = win rate, R = avg win / avg loss.
 // Full Kelly is aggressive and assumes stationary edge; we return a
