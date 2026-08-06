@@ -30,6 +30,8 @@ export default function AlwaysOnBot() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [startCashInput, setStartCashInput] = useState('10000');
+  const [lotOzInput, setLotOzInput] = useState('0.05');
+  const lotOzSynced = React.useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -38,6 +40,13 @@ export default function AlwaysOnBot() {
       if (!res.ok) throw new Error(data.error || 'Failed to load state');
       setState(data);
       setError('');
+      // Sync the lot-size input from server state once on first load only —
+      // afterward it's the user's own in-progress edit, not something to
+      // overwrite on every 5s poll.
+      if (!lotOzSynced.current && typeof data.lotOz === 'number') {
+        setLotOzInput(String(data.lotOz));
+        lotOzSynced.current = true;
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to load state');
     }
@@ -75,6 +84,15 @@ export default function AlwaysOnBot() {
     const val = parseFloat(startCashInput);
     sendControl({ action: 'reset', startCash: Number.isFinite(val) && val > 0 ? val : undefined });
   }, [startCashInput, sendControl]);
+
+  const handleApplyLotOz = useCallback(() => {
+    const val = parseFloat(lotOzInput);
+    if (Number.isFinite(val) && val > 0) {
+      sendControl({ action: 'setLotOz', lotOz: val });
+    } else if (state) {
+      setLotOzInput(String(state.lotOz));
+    }
+  }, [lotOzInput, sendControl, state]);
 
   if (!state) {
     return (
@@ -283,6 +301,53 @@ export default function AlwaysOnBot() {
         >
           <RotateCcw size={14} /> Reset (uses $ above)
         </button>
+      </div>
+
+      {/* Lot size / Kelly */}
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '20px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <label style={{ fontSize: '11px', color: THEME.muted }}>Lot size (oz)</label>
+        <input
+          className="aurum-input"
+          type="number"
+          min={0.00001}
+          step="0.001"
+          value={lotOzInput}
+          onChange={(e) => setLotOzInput(e.target.value)}
+          onBlur={handleApplyLotOz}
+          style={{
+            width: '110px',
+            background: THEME.panel,
+            color: THEME.text,
+            border: `1px solid ${THEME.hairline}`,
+            borderRadius: '6px',
+            padding: '8px 10px',
+            fontSize: '13px',
+            fontFamily: FONT_MONO,
+          }}
+        />
+        {state.price != null && (
+          <span style={{ fontSize: '11px', color: THEME.muted, fontFamily: FONT_MONO }}>
+            ≈ ${fmtUSD((parseFloat(lotOzInput) || 0) * state.price)} per trade at current price
+          </span>
+        )}
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            fontSize: '12px',
+            color: THEME.muted,
+            cursor: 'pointer',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={state.useKelly}
+            onChange={(e) => sendControl({ action: 'setUseKelly', useKelly: e.target.checked })}
+            disabled={busy}
+          />
+          Let Kelly sizing shrink the lot after a losing streak
+        </label>
       </div>
 
       {/* Metrics */}

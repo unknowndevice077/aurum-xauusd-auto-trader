@@ -229,28 +229,29 @@ export function technicalScore(
   return Math.max(-1, Math.min(1, score));
 }
 
-// Volatility-adjusted position sizing
+// Fixed-lot position sizing — spends up to `lotOz` ounces worth of capital
+// (clamped to whatever cash is actually available), rather than deriving
+// spend from a % of the account. The lot size is a direct, user-chosen
+// amount: no automatic shrinking based on account size or volatility. ATR
+// still widens the *stop-loss distance* when available (a genuinely
+// volatile market needs a wider stop to avoid noise-triggered exits) — that
+// adjusts where the stop sits, not how big the position is.
 export function calculatePositionSize(
   cash: number,
-  positionPct: number,
+  lotOz: number,
   price: number,
   atr: number | null,
   slPct: number
 ): { spend: number; oz: number; actualSlPct: number } {
-  const baseSpend = cash * (positionPct / 100);
+  const desiredSpend = Math.max(0, lotOz) * price;
+  const spend = Math.min(desiredSpend, Math.max(0, cash));
+  const oz = price > 0 ? spend / price : 0;
 
-  // If we have ATR data, adjust position size inversely with volatility
-  // Higher ATR = wider stops needed = smaller position to keep risk constant
   if (atr && atr > 0) {
     const atrPct = atr / price;
-    const volatilityMultiplier = Math.max(0.3, Math.min(2.0, slPct / atrPct));
-    const adjustedSpend = baseSpend * Math.min(1, 1 / volatilityMultiplier);
-    const oz = adjustedSpend / price;
-    // Adjust SL to be based on ATR (2x ATR) if ATR-based SL is wider than preset
     const atrSlPct = Math.max(slPct, atrPct * 2);
-    return { spend: adjustedSpend, oz, actualSlPct: atrSlPct };
+    return { spend, oz, actualSlPct: atrSlPct };
   }
 
-  const oz = baseSpend / price;
-  return { spend: baseSpend, oz, actualSlPct: slPct };
+  return { spend, oz, actualSlPct: slPct };
 }

@@ -26,7 +26,6 @@ import {
   Shield,
   Target,
   Brain,
-  History,
 } from 'lucide-react';
 import PriceChart, { Candle, TIMEFRAMES, TimeframeKey } from './PriceChart';
 import {
@@ -50,9 +49,7 @@ import {
   regimeThresholdAdjustment,
   regimeShouldBlock,
 } from '../lib/brain';
-import { getAccountTier } from '../lib/accountTier';
-import { RISK_PRESETS } from '../lib/riskPresets';
-import { runBacktest, type BacktestResult } from '../lib/backtest';
+import { RISK_PRESETS, RESERVE_FLOOR_PCT, DEFAULT_LOT_OZ } from '../lib/riskPresets';
 import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from '../lib/types';
 import {
   fmtUSD,
@@ -123,12 +120,11 @@ export default function AurumTerminal() {
   // (which gets trimmed by HISTORY_CAP) — used purely for the day/week/month
   // "market memory" monitoring panel.
   const [dailyHistory, setDailyHistory] = useState<{ t: number; p: number }[]>([]);
-  const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
-  const [backtestRunning, setBacktestRunning] = useState(false);
-  const [backtestError, setBacktestError] = useState('');
-  const [backtestYear, setBacktestYear] = useState('all'); // 'all' or a 4-digit calendar year string
   const [botRunning, setBotRunning] = useState(false);
   const [riskKey, setRiskKey] = useState('balanced');
+  const [lotOz, setLotOz] = useState(DEFAULT_LOT_OZ);
+  const [lotOzInput, setLotOzInput] = useState(String(DEFAULT_LOT_OZ));
+  const [useKelly, setUseKelly] = useState(false);
   const [mathOnly, setMathOnly] = useState(true);
   const [news, setNews] = useState<NewsResult | null>(null);
   const [newsLoading, setNewsLoading] = useState(false);
@@ -192,6 +188,18 @@ export default function AurumTerminal() {
       const storedBotRunning = localStorage.getItem('aurum-bot-running');
       if (storedBotRunning === 'true') {
         setBotRunning(true);
+      }
+      const storedLotOz = localStorage.getItem('aurum-lot-oz');
+      if (storedLotOz) {
+        const val = Number(storedLotOz);
+        if (Number.isFinite(val) && val > 0) {
+          setLotOz(val);
+          setLotOzInput(String(val));
+        }
+      }
+      const storedUseKelly = localStorage.getItem('aurum-use-kelly');
+      if (storedUseKelly === 'true') {
+        setUseKelly(true);
       }
       const storedConfig = localStorage.getItem('aurum-llm-config');
       if (storedConfig) {
@@ -257,6 +265,16 @@ export default function AurumTerminal() {
     if (!loaded) return;
     localStorage.setItem('aurum-bot-running', String(botRunning));
   }, [botRunning, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem('aurum-lot-oz', String(lotOz));
+  }, [lotOz, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem('aurum-use-kelly', String(useKelly));
+  }, [useKelly, loaded]);
 
   useEffect(() => {
     historyRef.current = priceHistory;
@@ -329,11 +347,11 @@ export default function AurumTerminal() {
     };
   }, [loaded]);
 
-  // ─── Daily History (for week/month market memory + backtest year picker) ─
+  // ─── Daily History (for week/month market memory) ──────────────────────
   // Fetched independently of the resumed-session check above so the
   // monitoring panel always has real week/month context, even when the live
-  // tick buffer was restored from localStorage. Requests the full available
-  // range (not just 1y) so the backtest can offer a real year selector.
+  // tick buffer was restored from localStorage. (The Backtest tab fetches
+  // its own copy — it lives in its own component now.)
   useEffect(() => {
     if (!loaded) return;
     let cancelled = false;
@@ -427,20 +445,16 @@ export default function AurumTerminal() {
         canUseNews ? newsRef.current?.bias ?? null : null
       );
       const regimeNowKey = regimeKey(regimeNow);
-      // Account-size-aware risk tiering: a $10 account gets smaller bets,
-      // pickier entries, and a bigger untouchable cash cushion than a
-      // $10,000 one, even though both use the same % math underneath.
-      const tier = getAccountTier(startCash);
-      const reserveFloor = Math.max(startCash * tier.reserveFloorPct, 0.01);
+      // A tiny fixed safety rail — not account-size scaling, just prevents
+      // a single trade from spending literally all available cash.
+      const reserveFloor = Math.max(startCash * RESERVE_FLOOR_PCT, 0.01);
 
       if (botRunning) {
         const cur = portfolioRef.current;
         const preset = RISK_PRESETS[riskKey];
 
-        // Dynamic threshold adjustment based on losing streak, plus the
-        // account tier's selectivity bump (micro/small accounts demand a
-        // cleaner signal before committing capital they can't spare).
-        let adjustedThreshold = preset.threshold + tier.thresholdBump;
+        // Dynamic threshold adjustment based on losing streak only.
+        let adjustedThreshold = preset.threshold;
         if (consecutiveLossesRef.current >= 3) {
           adjustedThreshold = Math.min(
             0.5,
@@ -665,28 +679,30 @@ export default function AurumTerminal() {
           const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
           if (!brainBlocked && combined > adjustedThreshold + regimeAdj) {
-            // Kelly-criterion position sizing: once we have enough closed-trade
-            // history, size the bet by our actual realized edge (win rate vs.
-            // avg win/loss) rather than a fixed % — a thin or negative edge
-            // shrinks the bet instead of always betting the preset max. The
-            // account tier further caps how large a single bet is allowed
-            // to be relative to the risk preset (smaller accounts get a
-            // tighter cap).
-            const stats = computeTradeStats(cur.trades);
-            const kelly = kellyFraction(
-              stats.winRate,
-              stats.avgWinPct,
-              stats.avgLossPct,
-              8,
-              stats.totalTrades
-            );
-            const tierCappedPositionPct = preset.positionPct * tier.positionCapMultiplier;
-            const effectivePositionPct =
-              kelly != null ? Math.min(tierCappedPositionPct, kelly * 100) : tierCappedPositionPct;
+            // Fixed lot size, chosen directly by the user — not derived
+            // from a % of capital or scaled by account size. Kelly is
+            // opt-in: when enabled, it can only shrink the lot (never grow
+            // it beyond what was requested) based on realized win rate /
+            // avg win-loss once there's enough trade history.
+            let effectiveLotOz = lotOz;
+            if (useKelly) {
+              const stats = computeTradeStats(cur.trades);
+              const kelly = kellyFraction(
+                stats.winRate,
+                stats.avgWinPct,
+                stats.avgLossPct,
+                8,
+                stats.totalTrades
+              );
+              if (kelly != null && nextPrice > 0) {
+                const kellyOz = (cur.cash * kelly) / nextPrice;
+                effectiveLotOz = Math.min(lotOz, kellyOz);
+              }
+            }
 
             const sized = calculatePositionSize(
               cur.cash,
-              effectivePositionPct,
+              effectiveLotOz,
               nextPrice,
               atr,
               preset.slPct
@@ -753,7 +769,7 @@ export default function AurumTerminal() {
       });
     }, TICK_MS);
     return () => clearInterval(id);
-  }, [price, botRunning, riskKey, canUseNews, startCash]);
+  }, [price, botRunning, riskKey, canUseNews, startCash, lotOz, useKelly]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────
   const handleReset = useCallback(
@@ -795,50 +811,15 @@ export default function AurumTerminal() {
     handleReset(clamped);
   }, [startCashInput, startCash, handleReset]);
 
-  const handleRunBacktest = useCallback(() => {
-    setBacktestError('');
-    if (dailyHistory.length === 0) {
-      setBacktestError('No historical data loaded yet — try again in a moment.');
+  const handleApplyLotOz = useCallback(() => {
+    const val = parseFloat(lotOzInput);
+    if (!Number.isFinite(val) || val <= 0) {
+      setLotOzInput(String(lotOz));
       return;
     }
-    setBacktestRunning(true);
-    // Yield a frame so the "running" state actually paints before the
-    // (synchronous, fast) backtest loop runs.
-    setTimeout(() => {
-      try {
-        let from: number | undefined;
-        let to: number | undefined;
-        if (backtestYear !== 'all') {
-          const year = parseInt(backtestYear, 10);
-          from = Math.floor(new Date(Date.UTC(year, 0, 1)).getTime() / 1000);
-          to = Math.floor(new Date(Date.UTC(year + 1, 0, 1)).getTime() / 1000) - 1;
-        }
-        const result = runBacktest(dailyHistory, { riskKey, startCash, from, to });
-        if (!result) {
-          setBacktestError(
-            backtestYear !== 'all'
-              ? `Not enough historical data in ${backtestYear} to backtest (need 55+ daily bars).`
-              : 'Not enough historical data to backtest (need 55+ daily bars).'
-          );
-          setBacktestResult(null);
-        } else {
-          setBacktestResult(result);
-        }
-      } catch (e: unknown) {
-        setBacktestError(e instanceof Error ? e.message : 'Backtest failed');
-      } finally {
-        setBacktestRunning(false);
-      }
-    }, 10);
-  }, [dailyHistory, riskKey, startCash, backtestYear]);
-
-  const availableBacktestYears = useMemo(() => {
-    const years = new Set<number>();
-    for (const pt of dailyHistory) {
-      years.add(new Date(pt.t * 1000).getUTCFullYear());
-    }
-    return Array.from(years).sort((a, b) => b - a);
-  }, [dailyHistory]);
+    setLotOzInput(String(val));
+    setLotOz(val);
+  }, [lotOzInput, lotOz]);
 
   const handleResetChart = useCallback(() => {
     setPriceHistory([]);
@@ -916,7 +897,6 @@ export default function AurumTerminal() {
     [dailyHistory]
   );
 
-  const accountTier = useMemo(() => getAccountTier(startCash), [startCash]);
   const equityValue = price ? portfolio.cash + portfolio.oz * price : portfolio.cash;
   const pnl = equityValue - startCash;
   const pnlPct = startCash > 0 ? (pnl / startCash) * 100 : 0;
@@ -1102,30 +1082,80 @@ export default function AurumTerminal() {
             >
               Apply &amp; reset portfolio
             </button>
-            <span
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'flex-end',
+              gap: '10px',
+              flexWrap: 'wrap',
+              marginBottom: '10px',
+            }}
+          >
+            <div>
+              <label
+                style={{
+                  fontSize: '11px',
+                  color: THEME.muted,
+                  display: 'block',
+                  marginBottom: '4px',
+                }}
+              >
+                Lot size (oz per trade)
+              </label>
+              <input
+                className="aurum-input"
+                type="number"
+                min={0.00001}
+                step="0.001"
+                value={lotOzInput}
+                onChange={(e) => setLotOzInput(e.target.value)}
+                onBlur={handleApplyLotOz}
+                style={{
+                  width: '140px',
+                  background: THEME.panel,
+                  color: THEME.text,
+                  border: `1px solid ${THEME.hairline}`,
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  fontSize: '13px',
+                  fontFamily: FONT_MONO,
+                  boxSizing: 'border-box',
+                }}
+              />
+            </div>
+            {price != null && (
+              <span style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted }}>
+                ≈ ${fmtUSD((parseFloat(lotOzInput) || 0) * price)} per trade at current price
+              </span>
+            )}
+            <label
               style={{
-                fontFamily: FONT_MONO,
-                fontSize: '11px',
-                color: THEME.goldBright,
-                background: THEME.panel,
-                border: `1px solid ${THEME.hairline}`,
-                borderRadius: '4px',
-                padding: '6px 10px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                fontSize: '12px',
+                color: THEME.muted,
+                cursor: 'pointer',
               }}
             >
-              {accountTier.name} account
-            </span>
+              <input
+                type="checkbox"
+                checked={useKelly}
+                onChange={(e) => setUseKelly(e.target.checked)}
+              />
+              Let Kelly sizing shrink the lot after a losing streak
+            </label>
           </div>
           <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '20px' }}>
-            {accountTier.description} Position sizing is capped at{' '}
-            {(accountTier.positionCapMultiplier * 100).toFixed(0)}% of the risk preset&apos;s
-            normal size, entries need a{' '}
-            {accountTier.thresholdBump >= 0 ? 'stricter' : 'slightly looser'} signal (
-            {accountTier.thresholdBump >= 0 ? '+' : ''}
-            {accountTier.thresholdBump.toFixed(2)} threshold), and{' '}
-            {(accountTier.reserveFloorPct * 100).toFixed(0)}% of starting capital (
-            ${fmtUSD(Math.max(startCash * accountTier.reserveFloorPct, 0.01))}) is always kept
-            in reserve, untouched by any single trade. Changing this resets the portfolio.
+            Position size is a direct lot size you choose — it&apos;s the same regardless of
+            account size, and only shrinks below what you set if Kelly sizing is enabled and your
+            realized track record looks weak. A tiny fixed rail keeps any single trade from
+            spending literally 100% of cash (
+            {(RESERVE_FLOOR_PCT * 100).toFixed(0)}% of starting capital, $
+            {fmtUSD(Math.max(startCash * RESERVE_FLOOR_PCT, 0.01))}, always stays untouched).
+            Bigger lots mean bigger swings both ways — sizing up doesn&apos;t create more winning
+            trades, it just makes existing ones (and losses) count for more.
           </div>
 
           <div
@@ -1380,7 +1410,7 @@ export default function AurumTerminal() {
           ))}
         </select>
         <span
-          title={accountTier.description}
+          title="Lot size per trade — set in LLM settings / Account panel"
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -1393,7 +1423,7 @@ export default function AurumTerminal() {
             padding: '8px 12px',
           }}
         >
-          <Target size={13} /> {accountTier.name} &middot; ${fmtUSD(startCash, 0)}
+          <Target size={13} /> {lotOz} oz lot &middot; ${fmtUSD(startCash, 0)}
         </span>
         <button
           onClick={() => setMathOnly((m) => !m)}
@@ -2037,334 +2067,6 @@ export default function AurumTerminal() {
             The brain builds this table from the bot&apos;s own closed paper trades &mdash; once
             it has 6-8+ trades in a given condition it starts nudging entries toward setups that
             have worked and away from (or outright skipping) ones that haven&apos;t.
-          </div>
-        )}
-      </div>
-
-      {/* Backtest */}
-      <div
-        style={{
-          background: THEME.panel,
-          border: `1px solid ${THEME.hairline}`,
-          borderRadius: '8px',
-          padding: '14px',
-          marginBottom: '16px',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            flexWrap: 'wrap',
-            gap: '10px',
-            marginBottom: '12px',
-          }}
-        >
-          <span
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              fontSize: '12px',
-              color: THEME.muted,
-              textTransform: 'uppercase',
-              letterSpacing: '0.04em',
-            }}
-          >
-            <History size={13} /> Backtest &middot; real GC=F daily history
-          </span>
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-            <select
-              value={backtestYear}
-              onChange={(e) => setBacktestYear(e.target.value)}
-              aria-label="Backtest year"
-              style={{
-                background: THEME.panelAlt,
-                color: THEME.text,
-                border: `1px solid ${THEME.hairline}`,
-                borderRadius: '6px',
-                padding: '8px 10px',
-                fontFamily: FONT_MONO,
-                fontSize: '12px',
-              }}
-            >
-              <option value="all">All available history</option>
-              {availableBacktestYears.map((y) => (
-                <option key={y} value={String(y)}>
-                  {y}
-                </option>
-              ))}
-            </select>
-            <button
-              onClick={handleRunBacktest}
-              disabled={backtestRunning || dailyHistory.length === 0}
-              aria-label="Run backtest"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                background: THEME.gold,
-                color: '#1A1508',
-                border: 'none',
-                borderRadius: '6px',
-                padding: '8px 14px',
-                fontFamily: FONT_SANS,
-                fontSize: '13px',
-                fontWeight: 500,
-                cursor: backtestRunning || dailyHistory.length === 0 ? 'not-allowed' : 'pointer',
-                opacity: backtestRunning || dailyHistory.length === 0 ? 0.6 : 1,
-              }}
-            >
-              {backtestRunning ? <Loader2 size={14} className="spin" /> : <History size={14} />}
-              {backtestRunning ? 'Running…' : 'Run backtest'}
-            </button>
-          </div>
-        </div>
-        <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '12px' }}>
-          Replays the same strategy (technical scoring, account-tier sizing, Kelly sizing, the
-          regime brain, breakeven &amp; trailing stop) against real historical GC=F daily closes,
-          using the current <strong style={{ color: THEME.text }}>{RISK_PRESETS[riskKey]?.label}</strong>{' '}
-          preset and <strong style={{ color: THEME.text }}>${fmtUSD(startCash, 0)}</strong> starting
-          capital, over{' '}
-          <strong style={{ color: THEME.text }}>
-            {backtestYear === 'all' ? 'all available history' : backtestYear}
-          </strong>
-          . Two honest limits: stop/take-profit checks use daily closes, not intraday highs and
-          lows, and there&apos;s no historical news feed, so this always runs math-only. A single
-          position at a time plus a selective entry threshold naturally means low trade counts —
-          this is a patient, one-position system, not a high-frequency one.
-        </div>
-
-        {backtestError && (
-          <div style={{ fontSize: '12px', color: THEME.loss, marginBottom: '10px' }}>
-            {backtestError}
-          </div>
-        )}
-
-        {backtestResult && (
-          <>
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
-                gap: '10px',
-                marginBottom: '14px',
-              }}
-            >
-              {[
-                {
-                  label: 'Total return',
-                  value: `${backtestResult.totalReturnPct >= 0 ? '+' : ''}${backtestResult.totalReturnPct.toFixed(2)}%`,
-                  color: backtestResult.totalReturnPct >= 0 ? THEME.gain : THEME.loss,
-                },
-                { label: 'Final equity', value: `$${fmtUSD(backtestResult.finalEquity)}` },
-                { label: 'Trades', value: `${backtestResult.stats.totalTrades}` },
-                {
-                  label: 'Win rate',
-                  value: `${(backtestResult.stats.winRate * 100).toFixed(0)}%`,
-                  sub: backtestResult.winRateCI
-                    ? `95% CI ${(backtestResult.winRateCI.low * 100).toFixed(0)}–${(backtestResult.winRateCI.high * 100).toFixed(0)}%`
-                    : undefined,
-                },
-                {
-                  label: 'Sharpe (ann.)',
-                  value: backtestResult.stats.sharpe != null ? backtestResult.stats.sharpe.toFixed(2) : '--',
-                },
-                {
-                  label: 'Max drawdown',
-                  value:
-                    backtestResult.stats.maxDrawdownPct != null
-                      ? `${backtestResult.stats.maxDrawdownPct.toFixed(2)}%`
-                      : '--',
-                  color: THEME.loss,
-                },
-              ].map((kpi) => (
-                <div
-                  key={kpi.label}
-                  style={{
-                    background: THEME.panelAlt,
-                    border: `1px solid ${THEME.hairline}`,
-                    borderRadius: '6px',
-                    padding: '8px 10px',
-                  }}
-                >
-                  <div style={{ fontSize: '10px', color: THEME.muted, marginBottom: '2px' }}>
-                    {kpi.label}
-                  </div>
-                  <div
-                    style={{
-                      fontFamily: FONT_MONO,
-                      fontSize: '14px',
-                      color: kpi.color || THEME.text,
-                    }}
-                  >
-                    {kpi.value}
-                  </div>
-                  {kpi.sub && (
-                    <div style={{ fontFamily: FONT_MONO, fontSize: '10px', color: THEME.muted }}>
-                      {kpi.sub}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-
-            {backtestResult.stats.totalTrades > 0 && backtestResult.stats.totalTrades < 30 && (
-              <div
-                style={{
-                  fontSize: '11px',
-                  color: THEME.muted,
-                  background: THEME.panelAlt,
-                  border: `1px solid ${THEME.hairline}`,
-                  borderRadius: '6px',
-                  padding: '8px 10px',
-                  marginBottom: '10px',
-                }}
-              >
-                Only {backtestResult.stats.totalTrades} trades &mdash; below ~30, win rate/Sharpe
-                are not statistically reliable (see the win rate&apos;s wide confidence interval
-                above). Treat these numbers as a rough signal, not a verdict.
-              </div>
-            )}
-
-            {backtestResult.anomalies.length > 0 && (
-              <div
-                style={{
-                  fontSize: '11px',
-                  color: THEME.muted,
-                  background: THEME.panelAlt,
-                  border: `1px solid ${THEME.gold}`,
-                  borderRadius: '6px',
-                  padding: '8px 10px',
-                  marginBottom: '10px',
-                }}
-              >
-                <strong style={{ color: THEME.text }}>
-                  {backtestResult.anomalies.length} unusually large single-day move
-                  {backtestResult.anomalies.length === 1 ? '' : 's'} in this data
-                </strong>{' '}
-                (&gt;8% in a day &mdash; larger than gold has moved in one real session even
-                during 2008 or 2020): {backtestResult.anomalies.slice(0, 5).map((a, i) => (
-                  <span key={a.t}>
-                    {i > 0 ? ', ' : ''}
-                    {new Date(a.t * 1000).toLocaleDateString()} ({a.changePct >= 0 ? '+' : ''}
-                    {a.changePct.toFixed(1)}%)
-                  </span>
-                ))}
-                {backtestResult.anomalies.length > 5 ? '…' : ''}. Could be a real move or an
-                artifact of Yahoo&apos;s free GC=F feed not being adjusted for futures contract
-                rollovers &mdash; shown here rather than silently altered, since telling the two
-                apart from price alone isn&apos;t reliable.
-              </div>
-            )}
-
-            {backtestResult.dateRange && (
-              <div style={{ fontSize: '10px', color: THEME.muted, marginBottom: '10px' }}>
-                {new Date(backtestResult.dateRange.from * 1000).toLocaleDateString()} &ndash;{' '}
-                {new Date(backtestResult.dateRange.to * 1000).toLocaleDateString()} &middot;{' '}
-                {backtestResult.barsTraded} daily bars
-              </div>
-            )}
-
-            <div style={{ height: '100px', marginBottom: '10px' }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={backtestResult.equityCurve}>
-                  <XAxis dataKey="t" hide />
-                  <YAxis domain={['auto', 'auto']} tick={{ fill: THEME.muted, fontSize: 10 }} width={50} />
-                  <Tooltip
-                    contentStyle={{
-                      background: THEME.panelAlt,
-                      border: `1px solid ${THEME.hairline}`,
-                      fontSize: '12px',
-                    }}
-                    labelFormatter={(t: number) => new Date(t * 1000).toLocaleDateString()}
-                    formatter={(v: number) => [`$${fmtUSD(v)}`, 'Equity']}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="value"
-                    stroke={THEME.gold}
-                    fill={THEME.gold}
-                    fillOpacity={0.12}
-                    strokeWidth={2}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-
-            {backtestResult.trades.length > 0 ? (
-              <div style={{ maxHeight: '220px', overflowY: 'auto' }}>
-                {backtestResult.trades.map((t) => (
-                  <div
-                    key={t.id}
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      padding: '6px 0',
-                      borderBottom: `1px solid ${THEME.hairline}`,
-                      gap: '10px',
-                      fontSize: '11px',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                      <span
-                        style={{
-                          fontFamily: FONT_MONO,
-                          fontSize: '10px',
-                          padding: '2px 6px',
-                          borderRadius: '3px',
-                          background: t.side === 'BUY' ? 'rgba(91,146,121,0.15)' : 'rgba(181,83,60,0.15)',
-                          color: t.side === 'BUY' ? THEME.gain : THEME.loss,
-                          flexShrink: 0,
-                        }}
-                      >
-                        {t.side}
-                      </span>
-                      <span
-                        style={{
-                          color: THEME.muted,
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                        }}
-                      >
-                        {t.time} &middot; {t.reasoning}
-                      </span>
-                    </div>
-                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                      <div style={{ fontFamily: FONT_MONO }}>
-                        {fmtOz(t.oz)} oz @ ${fmtUSD(t.price)}
-                      </div>
-                      {typeof t.pnl === 'number' && (
-                        <div
-                          style={{
-                            fontFamily: FONT_MONO,
-                            color: t.pnl >= 0 ? THEME.gain : THEME.loss,
-                          }}
-                        >
-                          {t.pnl >= 0 ? '+' : '-'}${fmtUSD(Math.abs(t.pnl))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div style={{ fontSize: '11px', color: THEME.muted }}>
-                No trades fired over this history at the current risk preset &mdash; try a less
-                conservative preset or a smaller account tier threshold bump.
-              </div>
-            )}
-          </>
-        )}
-
-        {!backtestResult && !backtestError && (
-          <div style={{ fontSize: '11px', color: THEME.muted }}>
-            {dailyHistory.length === 0
-              ? 'Loading historical data…'
-              : `${dailyHistory.length} days of real GC=F history loaded — click "Run backtest" to see how this strategy would have performed.`}
           </div>
         )}
       </div>

@@ -29,15 +29,6 @@ export type Portfolio = {
   trades: Trade[];
 };
 
-export type RiskPreset = {
-  label: string;
-  threshold: number;
-  positionPct: number;
-  slPct: number;
-  tpPct: number;
-  beTriggerPct: number;
-};
-
 export type NewsResult = {
   sentiment_score: number;
   confidence: number; // 0-1, how confident the model is in its own read

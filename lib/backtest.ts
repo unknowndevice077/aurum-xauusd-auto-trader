@@ -1,12 +1,12 @@
 // ─── Backtest Engine ─────────────────────────────────────────────────────
-// Replays the same strategy the live bot runs — technical scoring, the
-// account-tier sizing, Kelly sizing, the regime "brain", and the
+// Replays the same strategy the live bot runs — technical scoring, fixed-lot
+// sizing, optional Kelly sizing, the regime "brain", and the
 // breakeven/trailing stop — against real historical daily closes instead of
 // live simulated ticks. This is a pure function: no timers, no React state,
 // just a fast pass over the price array.
 //
 // Two honest limitations, both surfaced in the result and in the UI:
-//  1. Only daily closes are available (Yahoo GC=F, 1y) — no intraday highs/
+//  1. Only daily closes are available (Yahoo GC=F) — no intraday highs/
 //     lows, so a stop-loss/take-profit is checked against the day's close,
 //     not against whatever the price did intraday. Real intraday execution
 //     would differ.
@@ -33,8 +33,7 @@ import {
   regimeThresholdAdjustment,
   regimeShouldBlock,
 } from './brain';
-import { getAccountTier } from './accountTier';
-import { RISK_PRESETS, type RiskPresetKey } from './riskPresets';
+import { RISK_PRESETS, RESERVE_FLOOR_PCT, type RiskPresetKey } from './riskPresets';
 import type { Trade } from './types';
 
 const WARMUP_BARS = 50; // computeIndicators needs 50+ closes before it returns real values
@@ -54,7 +53,14 @@ export type BacktestResult = {
 
 export function runBacktest(
   history: { t: number; p: number }[],
-  opts: { riskKey: RiskPresetKey | string; startCash: number; from?: number; to?: number }
+  opts: {
+    riskKey: RiskPresetKey | string;
+    startCash: number;
+    lotOz: number;
+    useKelly?: boolean;
+    from?: number;
+    to?: number;
+  }
 ): BacktestResult | null {
   const preset = RISK_PRESETS[opts.riskKey];
   if (!preset) return null;
@@ -79,8 +85,7 @@ export function runBacktest(
 
   const anomalies = detectPriceAnomalies(points.slice(Math.max(0, startIdx - WARMUP_BARS)));
 
-  const tier = getAccountTier(opts.startCash);
-  const reserveFloor = Math.max(opts.startCash * tier.reserveFloorPct, 0.01);
+  const reserveFloor = Math.max(opts.startCash * RESERVE_FLOOR_PCT, 0.01);
 
   let cash = opts.startCash;
   let oz = 0;
@@ -108,7 +113,7 @@ export function runBacktest(
     const mrz = zScore(prices, 20);
     const regimeNowKey = regimeKey(classifyRegime(regression, rsi, bbWidth, null));
 
-    let adjustedThreshold = preset.threshold + tier.thresholdBump;
+    let adjustedThreshold = preset.threshold;
     if (consecutiveLosses >= 3) {
       adjustedThreshold = Math.min(0.5, adjustedThreshold * (1 + consecutiveLosses * 0.15));
     }
@@ -195,13 +200,21 @@ export function runBacktest(
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
       if (!brainBlocked && tech > adjustedThreshold + regimeAdj) {
-        const stats = computeTradeStats([...trades].reverse());
-        const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
-        const tierCappedPositionPct = preset.positionPct * tier.positionCapMultiplier;
-        const effectivePositionPct =
-          kelly != null ? Math.min(tierCappedPositionPct, kelly * 100) : tierCappedPositionPct;
+        // Fixed lot size by default — the user's chosen oz amount is used
+        // exactly. Kelly is opt-in: when enabled, it can only shrink the
+        // lot (never grow it beyond what was requested), based on realized
+        // win rate / avg win-loss once there's enough trade history.
+        let effectiveLotOz = opts.lotOz;
+        if (opts.useKelly) {
+          const stats = computeTradeStats([...trades].reverse());
+          const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
+          if (kelly != null && price > 0) {
+            const kellyOz = (cash * kelly) / price;
+            effectiveLotOz = Math.min(opts.lotOz, kellyOz);
+          }
+        }
 
-        const sized = calculatePositionSize(cash, effectivePositionPct, price, atr, preset.slPct);
+        const sized = calculatePositionSize(cash, effectiveLotOz, price, atr, preset.slPct);
         const maxSpend = Math.max(0, cash - reserveFloor);
         const spendScale = sized.spend > 0 ? Math.min(1, maxSpend / sized.spend) : 0;
         const spend = sized.spend * spendScale;

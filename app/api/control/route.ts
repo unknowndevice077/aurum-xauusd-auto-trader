@@ -10,6 +10,8 @@ const ControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('pause') }),
   z.object({ action: z.literal('reset'), startCash: z.number().min(1).max(10_000_000).optional() }),
   z.object({ action: z.literal('setRiskKey'), riskKey: z.string() }),
+  z.object({ action: z.literal('setLotOz'), lotOz: z.number().positive().max(1000) }),
+  z.object({ action: z.literal('setUseKelly'), useKelly: z.boolean() }),
 ]);
 
 // Public control surface for the always-on bot — start/pause/reset and
@@ -50,6 +52,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: `Unknown risk preset "${input.riskKey}"` }, { status: 400 });
       }
       await setState({ ...state, riskKey: input.riskKey });
+    } else if (input.action === 'setLotOz') {
+      await setState({ ...state, lotOz: input.lotOz });
+    } else if (input.action === 'setUseKelly') {
+      await setState({ ...state, useKelly: input.useKelly });
     }
 
     const next = await getState();

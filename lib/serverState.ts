@@ -12,7 +12,7 @@
 // production.
 
 import type { Portfolio } from './types';
-import { DEFAULT_START_CASH_FALLBACK } from './riskPresets';
+import { DEFAULT_START_CASH_FALLBACK, DEFAULT_LOT_OZ } from './riskPresets';
 
 export type ServerNews = {
   sentiment_score: number;
@@ -33,6 +33,8 @@ export type GlobalBotState = {
   botRunning: boolean;
   riskKey: string;
   startCash: number;
+  lotOz: number; // fixed lot size in oz, user-chosen — not auto-scaled by capital
+  useKelly: boolean; // opt-in: when true, Kelly can shrink (never grow) the lot
   consecutiveLosses: number;
   news: ServerNews | null;
   lastNewsAt: number | null;
@@ -70,6 +72,8 @@ export function defaultState(startCash: number = DEFAULT_START_CASH_FALLBACK): G
     botRunning: false,
     riskKey: 'balanced',
     startCash,
+    lotOz: DEFAULT_LOT_OZ,
+    useKelly: false,
     consecutiveLosses: 0,
     news: null,
     lastNewsAt: null,

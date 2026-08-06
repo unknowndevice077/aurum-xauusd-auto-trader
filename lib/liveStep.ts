@@ -1,9 +1,9 @@
 // ─── One Live Tick (server-side) ───────────────────────────────────────────
 // The always-on counterpart to the client's setInterval tick loop and the
-// backtest's per-bar loop — same strategy (technical scoring, account-tier
-// sizing, Kelly sizing, the regime brain, breakeven/trailing stop), but
-// driven by a single external call (the cron hitting /api/tick) instead of
-// a timer, and priced from a real live feed instead of a random walk.
+// backtest's per-bar loop — same strategy (technical scoring, fixed-lot
+// sizing, optional Kelly sizing, the regime brain, breakeven/trailing stop),
+// but driven by a single external call (the cron hitting /api/tick) instead
+// of a timer, and priced from a real live feed instead of a random walk.
 
 import { computeIndicators, technicalScore, calculatePositionSize } from './indicators';
 import {
@@ -20,8 +20,7 @@ import {
   regimeThresholdAdjustment,
   regimeShouldBlock,
 } from './brain';
-import { getAccountTier } from './accountTier';
-import { RISK_PRESETS } from './riskPresets';
+import { RISK_PRESETS, RESERVE_FLOOR_PCT } from './riskPresets';
 import { fetchServerNews } from './newsProvider';
 import type { GlobalBotState } from './serverState';
 import type { Trade } from './types';
@@ -84,13 +83,12 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
   const sentiment = news ? news.sentiment_score * newsAgeWeight : 0;
 
   const preset = RISK_PRESETS[state.riskKey] ?? RISK_PRESETS.balanced;
-  const tier = getAccountTier(state.startCash);
-  const reserveFloor = Math.max(state.startCash * tier.reserveFloorPct, 0.01);
+  const reserveFloor = Math.max(state.startCash * RESERVE_FLOOR_PCT, 0.01);
 
   let portfolio = { ...state.portfolio };
   let consecutiveLosses = state.consecutiveLosses;
 
-  let adjustedThreshold = preset.threshold + tier.thresholdBump;
+  let adjustedThreshold = preset.threshold;
   if (consecutiveLosses >= 3) {
     adjustedThreshold = Math.min(0.5, adjustedThreshold * (1 + consecutiveLosses * 0.15));
   }
@@ -194,13 +192,17 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
       if (!brainBlocked && combined > adjustedThreshold + regimeAdj) {
-        const stats = computeTradeStats(portfolio.trades);
-        const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
-        const tierCappedPositionPct = preset.positionPct * tier.positionCapMultiplier;
-        const effectivePositionPct =
-          kelly != null ? Math.min(tierCappedPositionPct, kelly * 100) : tierCappedPositionPct;
+        let effectiveLotOz = state.lotOz;
+        if (state.useKelly) {
+          const stats = computeTradeStats(portfolio.trades);
+          const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
+          if (kelly != null && nextPrice > 0) {
+            const kellyOz = (portfolio.cash * kelly) / nextPrice;
+            effectiveLotOz = Math.min(state.lotOz, kellyOz);
+          }
+        }
 
-        const sized = calculatePositionSize(portfolio.cash, effectivePositionPct, nextPrice, atr, preset.slPct);
+        const sized = calculatePositionSize(portfolio.cash, effectiveLotOz, nextPrice, atr, preset.slPct);
         const maxSpend = Math.max(0, portfolio.cash - reserveFloor);
         const spendScale = sized.spend > 0 ? Math.min(1, maxSpend / sized.spend) : 0;
         const spend = sized.spend * spendScale;
