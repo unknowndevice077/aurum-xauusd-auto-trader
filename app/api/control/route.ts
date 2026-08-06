@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getState, setState, freshPortfolio } from '../../../lib/serverState';
-import { RISK_PRESETS } from '../../../lib/riskPresets';
+import { RISK_PRESETS, MAX_LEVERAGE } from '../../../lib/riskPresets';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,6 +11,7 @@ const ControlSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('reset'), startCash: z.number().min(1).max(10_000_000).optional() }),
   z.object({ action: z.literal('setRiskKey'), riskKey: z.string() }),
   z.object({ action: z.literal('setLotOz'), lotOz: z.number().positive().max(1000) }),
+  z.object({ action: z.literal('setLeverage'), leverage: z.number().min(1).max(MAX_LEVERAGE) }),
   z.object({ action: z.literal('setUseKelly'), useKelly: z.boolean() }),
 ]);
 
@@ -54,6 +55,8 @@ export async function POST(req: NextRequest) {
       await setState({ ...state, riskKey: input.riskKey });
     } else if (input.action === 'setLotOz') {
       await setState({ ...state, lotOz: input.lotOz });
+    } else if (input.action === 'setLeverage') {
+      await setState({ ...state, leverage: input.leverage });
     } else if (input.action === 'setUseKelly') {
       await setState({ ...state, useKelly: input.useKelly });
     }

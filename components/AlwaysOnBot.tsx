@@ -11,7 +11,7 @@ import {
 } from 'recharts';
 import { Play, Pause, RotateCcw, Radio, AlertTriangle, Newspaper } from 'lucide-react';
 import { THEME, FONT_SERIF, FONT_MONO, FONT_SANS } from '../lib/theme';
-import { RISK_PRESETS } from '../lib/riskPresets';
+import { RISK_PRESETS, MAX_LEVERAGE } from '../lib/riskPresets';
 import { fmtUSD, fmtOz } from '../lib/helpers';
 import type { GlobalBotState } from '../lib/serverState';
 
@@ -325,9 +325,35 @@ export default function AlwaysOnBot() {
             fontFamily: FONT_MONO,
           }}
         />
+        <label style={{ fontSize: '11px', color: THEME.muted }} title="1x = full notional in cash. Raising this lets a lot size that would otherwise be unaffordable actually trade, using only a fraction of its value as margin.">
+          Leverage
+        </label>
+        <select
+          value={state.leverage}
+          onChange={(e) => sendControl({ action: 'setLeverage', leverage: Number(e.target.value) })}
+          disabled={busy}
+          style={{
+            background: THEME.panel,
+            color: THEME.text,
+            border: `1px solid ${THEME.hairline}`,
+            borderRadius: '6px',
+            padding: '8px 10px',
+            fontSize: '13px',
+            fontFamily: FONT_MONO,
+          }}
+        >
+          {[1, 2, 5, 10, 20].filter((l) => l <= MAX_LEVERAGE).map((l) => (
+            <option key={l} value={l}>
+              {l}x
+            </option>
+          ))}
+        </select>
         {state.price != null && (
           <span style={{ fontSize: '11px', color: THEME.muted, fontFamily: FONT_MONO }}>
-            ≈ ${fmtUSD((parseFloat(lotOzInput) || 0) * state.price)} per trade at current price
+            ≈ ${fmtUSD(((parseFloat(lotOzInput) || 0) * state.price) / (state.leverage || 1))} margin per trade
+            {state.leverage > 1
+              ? ` (notional $${fmtUSD((parseFloat(lotOzInput) || 0) * state.price, 0)} at ${state.leverage}x)`
+              : ''}
           </span>
         )}
         <label

@@ -26,6 +26,13 @@ export type Portfolio = {
   positionThreshold: number | null;
   positionBeTriggerPct: number | null;
   positionUsesNews: boolean | null;
+  // Cash actually committed to the open position. At 1x leverage this
+  // equals oz * entryPrice (today's cash-settled behavior); under leverage
+  // it's the smaller margin amount. Stored (not recomputed) so closing the
+  // position returns exactly what was set aside plus/minus P&L, rather than
+  // the position's full notional value — crediting the full notional back
+  // against a margin-only debit would fabricate money out of the leverage.
+  marginUsed: number | null;
   trades: Trade[];
 };
 
@@ -49,7 +56,9 @@ export type ProviderMeta = {
 };
 
 export type PositionSizeResult = {
-  spend: number;
+  spend: number; // margin committed — what actually leaves cash, not the position's full notional under leverage
   oz: number;
   actualSlPct: number;
+  notional: number; // oz * price — the position's real exposure size, for display/transparency
+  liqPrice: number; // price at which this position's margin would be fully consumed by losses (long-only); the effective stop-loss can never sit looser than this
 };

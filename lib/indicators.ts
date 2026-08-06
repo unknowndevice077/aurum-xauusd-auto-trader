@@ -229,29 +229,47 @@ export function technicalScore(
   return Math.max(-1, Math.min(1, score));
 }
 
-// Fixed-lot position sizing — spends up to `lotOz` ounces worth of capital
-// (clamped to whatever cash is actually available), rather than deriving
-// spend from a % of the account. The lot size is a direct, user-chosen
-// amount: no automatic shrinking based on account size or volatility. ATR
-// still widens the *stop-loss distance* when available (a genuinely
-// volatile market needs a wider stop to avoid noise-triggered exits) — that
-// adjusts where the stop sits, not how big the position is.
+// Fixed-lot position sizing — targets `lotOz` ounces of exposure, clamped
+// to whatever *margin* is actually available, rather than deriving spend
+// from a % of the account. The lot size is a direct, user-chosen amount: no
+// automatic shrinking based on account size or volatility — except by the
+// leverage-driven margin requirement itself. ATR still widens the
+// *stop-loss distance* when available (a genuinely volatile market needs a
+// wider stop to avoid noise-triggered exits) — that adjusts where the stop
+// sits, not how big the position is.
+//
+// `leverage` (1 = off, today's fully cash-settled behavior) determines how
+// much cash a given notional exposure actually costs: margin = notional /
+// leverage. At gold's price, 1x makes even a small lot require a lot of
+// cash — leverage is what lets a small account actually trade the lot size
+// it configured, the same mechanism real gold CFD/forex brokers use,
+// instead of the app silently shrinking every trade to whatever fits.
 export function calculatePositionSize(
   cash: number,
   lotOz: number,
   price: number,
   atr: number | null,
-  slPct: number
-): { spend: number; oz: number; actualSlPct: number } {
-  const desiredSpend = Math.max(0, lotOz) * price;
-  const spend = Math.min(desiredSpend, Math.max(0, cash));
-  const oz = price > 0 ? spend / price : 0;
+  slPct: number,
+  leverage: number = 1
+): { spend: number; oz: number; actualSlPct: number; notional: number; liqPrice: number } {
+  const safeLeverage = leverage > 0 ? leverage : 1;
+  const targetNotional = Math.max(0, lotOz) * price;
+  const targetMargin = targetNotional / safeLeverage;
+  const margin = Math.min(targetMargin, Math.max(0, cash));
+  const scale = targetMargin > 0 ? margin / targetMargin : 0;
+  const oz = lotOz * scale;
+  const notional = oz * price;
 
-  if (atr && atr > 0) {
-    const atrPct = atr / price;
-    const atrSlPct = Math.max(slPct, atrPct * 2);
-    return { spend, oz, actualSlPct: atrSlPct };
-  }
+  const actualSlPct =
+    atr && atr > 0 ? Math.max(slPct, (atr / price) * 2) : slPct;
 
-  return { spend, oz, actualSlPct: slPct };
+  // Liquidation floor: the price at which this position's margin is fully
+  // consumed by losses (long-only) — a real leveraged broker force-closes
+  // here rather than let the account go negative. Leave a 10% buffer inside
+  // that floor (liquidate a bit before margin hits exactly zero), matching
+  // how real brokers add a maintenance-margin cushion.
+  const liqDistancePct = (1 / safeLeverage) * 0.9;
+  const liqPrice = price * (1 - liqDistancePct);
+
+  return { spend: margin, oz, actualSlPct, notional, liqPrice };
 }

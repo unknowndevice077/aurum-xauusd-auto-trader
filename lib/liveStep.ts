@@ -122,9 +122,13 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
       const posUsesNews = portfolio.positionUsesNews ?? canUseNews;
 
       const closePosition = (reasoning: string): number => {
-        const proceeds = portfolio.oz * nextPrice;
         const pnl = (nextPrice - portfolio.entryPrice!) * portfolio.oz;
         const pnlPct = ((nextPrice - portfolio.entryPrice!) / portfolio.entryPrice!) * 100;
+        // Return the margin that was actually committed plus/minus P&L —
+        // not oz * price (the full notional). Crediting the full notional
+        // back against a margin-only debit would fabricate the leveraged
+        // portion of the position as free money.
+        const returned = (portfolio.marginUsed ?? portfolio.oz * portfolio.entryPrice!) + pnl;
         const trade: Trade = {
           id: now,
           ts: nowSec,
@@ -132,14 +136,14 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
           side: 'SELL',
           price: nextPrice,
           oz: portfolio.oz,
-          value: proceeds,
+          value: returned,
           pnl,
           pnlPct,
           reasoning,
         };
         portfolio = {
           ...portfolio,
-          cash: portfolio.cash + proceeds,
+          cash: portfolio.cash + Math.max(0, returned),
           oz: 0,
           entryPrice: null,
           entryTs: null,
@@ -150,6 +154,7 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
           positionThreshold: null,
           positionBeTriggerPct: null,
           positionUsesNews: null,
+          marginUsed: null,
           trades: [trade, ...portfolio.trades].slice(0, 100),
         };
         return pnl;
@@ -242,29 +247,34 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
         entrySignalActive && pendingEntrySince != null && now - pendingEntrySince >= SIGNAL_CONFIRM_MS;
 
       if (entryConfirmed) {
+        const leverage = state.leverage || 1;
         let effectiveLotOz = state.lotOz;
         if (state.useKelly) {
           const stats = computeTradeStats(portfolio.trades);
           const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
           if (kelly != null && nextPrice > 0) {
-            const kellyOz = (portfolio.cash * kelly) / nextPrice;
+            const kellyOz = (portfolio.cash * kelly * leverage) / nextPrice;
             effectiveLotOz = Math.min(state.lotOz, kellyOz);
           }
         }
 
-        const sized = calculatePositionSize(portfolio.cash, effectiveLotOz, nextPrice, atr, preset.slPct);
+        const sized = calculatePositionSize(portfolio.cash, effectiveLotOz, nextPrice, atr, preset.slPct, leverage);
         const maxSpend = Math.max(0, portfolio.cash - reserveFloor);
         const spendScale = sized.spend > 0 ? Math.min(1, maxSpend / sized.spend) : 0;
         const spend = sized.spend * spendScale;
         const oz = sized.oz * spendScale;
 
         if (spend >= 0.01 && oz > 0) {
-          const slPrice = nextPrice * (1 - sized.actualSlPct);
+          // Effective stop can never sit looser than the leverage
+          // liquidation floor — at high leverage the margin cushion can be
+          // tighter than the preset's own stop-loss %.
+          const slPrice = Math.max(nextPrice * (1 - sized.actualSlPct), sized.liqPrice);
           const tpPrice = nextPrice * (1 + preset.tpPct);
           const brainNote =
             matchedRegimeStat && matchedRegimeStat.trades >= 6
               ? ` · brain: ${(matchedRegimeStat.winRate * 100).toFixed(0)}% win in "${regimeNowKey}" (${matchedRegimeStat.trades} past trades)`
               : '';
+          const leverageNote = leverage > 1 ? ` · ${leverage}x, notional $${sized.notional.toFixed(0)}` : '';
           const reasoning = !canUseNews
             ? `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (server, math-only)`
             : `${tech >= 0 ? 'Uptrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment >= 0 ? 'supportive' : 'cautious'}`;
@@ -276,7 +286,7 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
             price: nextPrice,
             oz,
             value: spend,
-            reasoning: `${reasoning} · SL $${slPrice.toFixed(2)} / TP $${tpPrice.toFixed(2)}${brainNote}`,
+            reasoning: `${reasoning} · SL $${slPrice.toFixed(2)} / TP $${tpPrice.toFixed(2)}${brainNote}${leverageNote}`,
             regime: regimeNowKey,
           };
           portfolio = {
@@ -289,6 +299,7 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
             slPrice,
             tpPrice,
             beActive: false,
+            marginUsed: spend,
             positionThreshold: adjustedThreshold,
             positionBeTriggerPct: preset.beTriggerPct,
             positionUsesNews: canUseNews,

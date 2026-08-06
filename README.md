@@ -53,6 +53,17 @@ connected, and nothing here is financial advice.
 - **Position sizing**: fixed lot size in oz, set by the user, not scaled by
   account size/tier. An optional Kelly toggle can *shrink* (never grow) the
   lot based on the bot's own trailing win rate/avg win/avg loss.
+- **Leverage** (1x–20x, default 1x/off): at 1x, buying a lot costs its full
+  notional value in cash (`lotOz * price`) — at gold's price that puts even
+  a modest lot out of reach for a small account, silently shrinking every
+  trade down to whatever cash affords regardless of the lot size
+  configured. Raising leverage requires only `notional / leverage` in
+  margin instead, the same mechanism real gold CFD/forex brokers use, so a
+  small account can actually trade the lot size it set. Closing a position
+  returns the margin plus/minus P&L (not the full notional) and a
+  liquidation floor — the price at which a position's margin would be
+  fully lost — always takes priority over the preset's own stop-loss if
+  leverage makes the margin cushion tighter.
 - **Exits**: hard stop-loss and take-profit, a breakeven arm once price
   moves a configurable fraction toward TP, and a genuine trailing stop that
   ratchets behind the peak price (via ATR) once breakeven is armed.

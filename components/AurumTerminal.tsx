@@ -49,7 +49,7 @@ import {
   regimeThresholdAdjustment,
   regimeShouldBlock,
 } from '../lib/brain';
-import { RISK_PRESETS, RESERVE_FLOOR_PCT, DEFAULT_LOT_OZ } from '../lib/riskPresets';
+import { RISK_PRESETS, RESERVE_FLOOR_PCT, DEFAULT_LOT_OZ, DEFAULT_LEVERAGE, MAX_LEVERAGE } from '../lib/riskPresets';
 import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from '../lib/types';
 import {
   fmtUSD,
@@ -125,6 +125,7 @@ export default function AurumTerminal() {
     positionThreshold: null,
     positionBeTriggerPct: null,
     positionUsesNews: null,
+    marginUsed: null,
     trades: [],
   });
   const [equityCurve, setEquityCurve] = useState<{ t: number; value: number }[]>([]);
@@ -136,6 +137,7 @@ export default function AurumTerminal() {
   const [riskKey, setRiskKey] = useState('balanced');
   const [lotOz, setLotOz] = useState(DEFAULT_LOT_OZ);
   const [lotOzInput, setLotOzInput] = useState(String(DEFAULT_LOT_OZ));
+  const [leverage, setLeverage] = useState(DEFAULT_LEVERAGE);
   const [useKelly, setUseKelly] = useState(false);
   const [mathOnly, setMathOnly] = useState(true);
   const [news, setNews] = useState<NewsResult | null>(null);
@@ -178,6 +180,7 @@ export default function AurumTerminal() {
             positionThreshold: null,
             positionBeTriggerPct: null,
             positionUsesNews: null,
+            marginUsed: null,
             ...parsed,
             trades: backfillTradePnl(parsed.trades || []),
           });
@@ -215,6 +218,13 @@ export default function AurumTerminal() {
       const storedUseKelly = localStorage.getItem('aurum-use-kelly');
       if (storedUseKelly === 'true') {
         setUseKelly(true);
+      }
+      const storedLeverage = localStorage.getItem('aurum-leverage');
+      if (storedLeverage) {
+        const val = Number(storedLeverage);
+        if (Number.isFinite(val) && val >= 1 && val <= MAX_LEVERAGE) {
+          setLeverage(val);
+        }
       }
       const storedConfig = localStorage.getItem('aurum-llm-config');
       if (storedConfig) {
@@ -290,6 +300,11 @@ export default function AurumTerminal() {
     if (!loaded) return;
     localStorage.setItem('aurum-use-kelly', String(useKelly));
   }, [useKelly, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem('aurum-leverage', String(leverage));
+  }, [leverage, loaded]);
 
   useEffect(() => {
     historyRef.current = priceHistory;
@@ -492,7 +507,6 @@ export default function AurumTerminal() {
 
           // ─── Stop-Loss Hit ───────────────────────────────────────────────
           if (cur.slPrice != null && nextPrice <= cur.slPrice) {
-            const proceeds = cur.oz * nextPrice;
             const label = !cur.beActive
               ? 'Stop-loss hit'
               : cur.entryPrice != null && cur.slPrice > cur.entryPrice
@@ -500,6 +514,10 @@ export default function AurumTerminal() {
                 : 'Breakeven stop hit';
             const pnl = (nextPrice - cur.entryPrice) * cur.oz;
             const pnlPct = ((nextPrice - cur.entryPrice) / cur.entryPrice) * 100;
+            // Return margin committed plus/minus P&L, not oz * price (full
+            // notional) — crediting full notional back against a
+            // margin-only debit would fabricate leveraged gains.
+            const returned = (cur.marginUsed ?? cur.oz * cur.entryPrice) + pnl;
             const trade: Trade = {
               id: Date.now(),
               ts: nowSec,
@@ -507,14 +525,14 @@ export default function AurumTerminal() {
               side: 'SELL',
               price: nextPrice,
               oz: cur.oz,
-              value: proceeds,
+              value: returned,
               pnl,
               pnlPct,
               reasoning: label,
             };
             portfolioRef.current = {
               ...cur,
-              cash: cur.cash + proceeds,
+              cash: cur.cash + Math.max(0, returned),
               oz: 0,
               entryPrice: null,
               entryTs: null,
@@ -525,6 +543,7 @@ export default function AurumTerminal() {
               positionThreshold: null,
               positionBeTriggerPct: null,
               positionUsesNews: null,
+              marginUsed: null,
               trades: [trade, ...cur.trades].slice(0, 100),
             };
             setPortfolio(portfolioRef.current);
@@ -541,9 +560,9 @@ export default function AurumTerminal() {
           }
           // ─── Take-Profit Hit ────────────────────────────────────────────
           else if (cur.tpPrice != null && nextPrice >= cur.tpPrice) {
-            const proceeds = cur.oz * nextPrice;
             const pnl = (nextPrice - cur.entryPrice) * cur.oz;
             const pnlPct = ((nextPrice - cur.entryPrice) / cur.entryPrice) * 100;
+            const returned = (cur.marginUsed ?? cur.oz * cur.entryPrice) + pnl;
             const trade: Trade = {
               id: Date.now(),
               ts: nowSec,
@@ -551,14 +570,14 @@ export default function AurumTerminal() {
               side: 'SELL',
               price: nextPrice,
               oz: cur.oz,
-              value: proceeds,
+              value: returned,
               pnl,
               pnlPct,
               reasoning: 'Take-profit hit',
             };
             portfolioRef.current = {
               ...cur,
-              cash: cur.cash + proceeds,
+              cash: cur.cash + Math.max(0, returned),
               oz: 0,
               entryPrice: null,
               entryTs: null,
@@ -569,6 +588,7 @@ export default function AurumTerminal() {
               positionThreshold: null,
               positionBeTriggerPct: null,
               positionUsesNews: null,
+              marginUsed: null,
               trades: [trade, ...cur.trades].slice(0, 100),
             };
             setPortfolio(portfolioRef.current);
@@ -646,12 +666,12 @@ export default function AurumTerminal() {
               nowMs - pendingExitSinceRef.current >= SIGNAL_CONFIRM_MS;
             if (minHoldElapsed && exitConfirmed) {
               const liveCur = portfolioRef.current;
-              const proceeds = liveCur.oz * nextPrice;
               const reasoning = !posUsesNews
                 ? `Downtrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (math-only)`
                 : `${tech <= 0 ? 'Downtrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment < 0 ? 'negative' : 'cooling'}${newsRef.current?.key_driver ? ' (' + newsRef.current.key_driver + ')' : ''}`;
               const pnl = (nextPrice - liveCur.entryPrice!) * liveCur.oz;
               const pnlPct = ((nextPrice - liveCur.entryPrice!) / liveCur.entryPrice!) * 100;
+              const returned = (liveCur.marginUsed ?? liveCur.oz * liveCur.entryPrice!) + pnl;
               const trade: Trade = {
                 id: Date.now(),
                 ts: nowSec,
@@ -659,14 +679,14 @@ export default function AurumTerminal() {
                 side: 'SELL',
                 price: nextPrice,
                 oz: liveCur.oz,
-                value: proceeds,
+                value: returned,
                 pnl,
                 pnlPct,
                 reasoning,
               };
               portfolioRef.current = {
                 ...liveCur,
-                cash: liveCur.cash + proceeds,
+                cash: liveCur.cash + Math.max(0, returned),
                 oz: 0,
                 entryPrice: null,
                 entryTs: null,
@@ -677,6 +697,7 @@ export default function AurumTerminal() {
                 positionThreshold: null,
                 positionBeTriggerPct: null,
                 positionUsesNews: null,
+                marginUsed: null,
                 trades: [trade, ...liveCur.trades].slice(0, 100),
               };
               setPortfolio(portfolioRef.current);
@@ -757,7 +778,7 @@ export default function AurumTerminal() {
                 stats.totalTrades
               );
               if (kelly != null && nextPrice > 0) {
-                const kellyOz = (cur.cash * kelly) / nextPrice;
+                const kellyOz = (cur.cash * kelly * leverage) / nextPrice;
                 effectiveLotOz = Math.min(lotOz, kellyOz);
               }
             }
@@ -767,7 +788,8 @@ export default function AurumTerminal() {
               effectiveLotOz,
               nextPrice,
               atr,
-              preset.slPct
+              preset.slPct,
+              leverage
             );
             // Never let a single entry breach the account's reserve floor —
             // clamp spend down (proportionally, so oz stays consistent) if
@@ -782,8 +804,10 @@ export default function AurumTerminal() {
             // its reserve floor) rather than opening a position too small
             // to meaningfully track.
             if (spend >= 0.01 && oz > 0) {
-              // FIX: Use actualSlPct from calculatePositionSize instead of preset.slPct
-              const slPrice = nextPrice * (1 - actualSlPct);
+              // Effective stop can never sit looser than the leverage
+              // liquidation floor — at high leverage the margin cushion can
+              // be tighter than the preset's own stop-loss %.
+              const slPrice = Math.max(nextPrice * (1 - actualSlPct), sized.liqPrice);
               const tpPrice = nextPrice * (1 + preset.tpPct);
               const reasoning = !canUseNews
                 ? `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (math-only)`
@@ -792,6 +816,8 @@ export default function AurumTerminal() {
                 matchedRegimeStat && matchedRegimeStat.trades >= 6
                   ? ` · brain: ${(matchedRegimeStat.winRate * 100).toFixed(0)}% win in "${regimeNowKey}" (${matchedRegimeStat.trades} past trades)`
                   : '';
+              const leverageNote =
+                leverage > 1 ? ` · ${leverage}x, notional $${fmtUSD(sized.notional, 0)}` : '';
               const trade: Trade = {
                 id: Date.now(),
                 ts: nowSec,
@@ -800,7 +826,7 @@ export default function AurumTerminal() {
                 price: nextPrice,
                 oz,
                 value: spend,
-                reasoning: `${reasoning} · SL $${fmtUSD(slPrice)} / TP $${fmtUSD(tpPrice)}${atr ? ' · ATR $' + fmtUSD(atr) : ''}${brainNote}`,
+                reasoning: `${reasoning} · SL $${fmtUSD(slPrice)} / TP $${fmtUSD(tpPrice)}${atr ? ' · ATR $' + fmtUSD(atr) : ''}${brainNote}${leverageNote}`,
                 regime: regimeNowKey,
               };
               portfolioRef.current = {
@@ -816,6 +842,7 @@ export default function AurumTerminal() {
                 positionThreshold: adjustedThreshold,
                 positionBeTriggerPct: preset.beTriggerPct,
                 positionUsesNews: canUseNews,
+                marginUsed: spend,
                 trades: [trade, ...cur.trades].slice(0, 100),
               };
               setPortfolio(portfolioRef.current);
@@ -832,7 +859,7 @@ export default function AurumTerminal() {
       });
     }, TICK_MS);
     return () => clearInterval(id);
-  }, [price, botRunning, riskKey, canUseNews, startCash, lotOz, useKelly]);
+  }, [price, botRunning, riskKey, canUseNews, startCash, lotOz, leverage, useKelly]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────
   const handleReset = useCallback(
@@ -851,6 +878,7 @@ export default function AurumTerminal() {
         positionThreshold: null,
         positionBeTriggerPct: null,
         positionUsesNews: null,
+        marginUsed: null,
         trades: [],
       };
       setPortfolio(fresh);
@@ -1190,9 +1218,47 @@ export default function AurumTerminal() {
                 }}
               />
             </div>
+            <div>
+              <label
+                style={{
+                  fontSize: '11px',
+                  color: THEME.muted,
+                  display: 'block',
+                  marginBottom: '4px',
+                }}
+                title="1x = full notional in cash (today's default). Raising this lets a lot size that would otherwise be unaffordable actually trade, using only a fraction of its value as margin — same mechanism real gold CFD/forex brokers use."
+              >
+                Leverage
+              </label>
+              <select
+                className="aurum-input"
+                value={leverage}
+                onChange={(e) => setLeverage(Number(e.target.value))}
+                style={{
+                  width: '90px',
+                  background: THEME.panel,
+                  color: THEME.text,
+                  border: `1px solid ${THEME.hairline}`,
+                  borderRadius: '6px',
+                  padding: '8px 10px',
+                  fontSize: '13px',
+                  fontFamily: FONT_MONO,
+                }}
+              >
+                {[1, 2, 5, 10, 20].filter((l) => l <= MAX_LEVERAGE).map((l) => (
+                  <option key={l} value={l}>
+                    {l}x
+                  </option>
+                ))}
+              </select>
+            </div>
             {price != null && (
               <span style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted }}>
-                ≈ ${fmtUSD((parseFloat(lotOzInput) || 0) * price)} per trade at current price
+                ≈ ${fmtUSD(((parseFloat(lotOzInput) || 0) * price) / leverage)} margin per trade
+                {leverage > 1
+                  ? ` (notional $${fmtUSD((parseFloat(lotOzInput) || 0) * price, 0)} at ${leverage}x)`
+                  : ''}{' '}
+                at current price
               </span>
             )}
             <label
@@ -1216,12 +1282,17 @@ export default function AurumTerminal() {
           <div style={{ fontSize: '11px', color: THEME.muted, marginBottom: '20px' }}>
             Position size is a direct lot size you choose — it&apos;s the same regardless of
             account size, and only shrinks below what you set if Kelly sizing is enabled and your
-            realized track record looks weak. A tiny fixed rail keeps any single trade from
-            spending literally 100% of cash (
+            realized track record looks weak, or if there isn&apos;t enough margin to cover it at
+            the current leverage (at 1x, that means not enough cash to cover the lot&apos;s full
+            value — raising leverage lowers how much cash a given lot actually costs). A tiny
+            fixed rail keeps any single trade from spending literally 100% of cash (
             {(RESERVE_FLOOR_PCT * 100).toFixed(0)}% of starting capital, $
             {fmtUSD(Math.max(startCash * RESERVE_FLOOR_PCT, 0.01))}, always stays untouched).
-            Bigger lots mean bigger swings both ways — sizing up doesn&apos;t create more winning
-            trades, it just makes existing ones (and losses) count for more.
+            Bigger lots and higher leverage both mean bigger swings both ways — sizing up
+            doesn&apos;t create more winning trades, it just makes existing ones (and losses)
+            count for more. At leverage &gt; 1x, a stop-loss also can&apos;t sit looser than the
+            price at which the position&apos;s margin would be fully lost — that floor tightens
+            automatically as leverage increases.
           </div>
 
           <div

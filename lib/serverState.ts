@@ -12,7 +12,7 @@
 // production.
 
 import type { Portfolio } from './types';
-import { DEFAULT_START_CASH_FALLBACK, DEFAULT_LOT_OZ } from './riskPresets';
+import { DEFAULT_START_CASH_FALLBACK, DEFAULT_LOT_OZ, DEFAULT_LEVERAGE } from './riskPresets';
 
 export type ServerNews = {
   sentiment_score: number;
@@ -34,6 +34,7 @@ export type GlobalBotState = {
   riskKey: string;
   startCash: number;
   lotOz: number; // fixed lot size in oz, user-chosen — not auto-scaled by capital
+  leverage: number; // 1 = cash-settled (off); >1 lets a lot's margin cost less than its full notional
   useKelly: boolean; // opt-in: when true, Kelly can shrink (never grow) the lot
   consecutiveLosses: number;
   lastExitAt: number | null; // re-entry cooldown — don't re-enter right into the noise that just exited
@@ -61,6 +62,7 @@ export function freshPortfolio(cash: number): Portfolio {
     positionThreshold: null,
     positionBeTriggerPct: null,
     positionUsesNews: null,
+    marginUsed: null,
     trades: [],
   };
 }
@@ -76,6 +78,7 @@ export function defaultState(startCash: number = DEFAULT_START_CASH_FALLBACK): G
     riskKey: 'balanced',
     startCash,
     lotOz: DEFAULT_LOT_OZ,
+    leverage: DEFAULT_LEVERAGE,
     useKelly: false,
     consecutiveLosses: 0,
     lastExitAt: null,

@@ -55,3 +55,17 @@ export const RESERVE_FLOOR_PCT = 0.05;
 // adjust it to their own capital (e.g. a $10 account probably wants
 // something like 0.001 oz, not this default).
 export const DEFAULT_LOT_OZ = 0.05;
+
+// Leverage: at 1x, buying `lotOz` requires paying its full notional value
+// (lotOz * price) in cash — at gold's price that puts even a modest lot
+// out of reach for a small account, silently shrinking every trade down to
+// whatever fits regardless of the lot size configured. Real gold CFD/forex
+// brokers instead require only a fraction of the notional as margin. 1x
+// (off) preserves today's cash-settled behavior exactly; raising it lets a
+// small account actually trade the lot size it configured. Capped well
+// below what real brokers sometimes offer (up to 1:200+) — higher leverage
+// means a smaller adverse move wipes the margin backing a position, and
+// this is a paper-trading educational tool, not a venue for teaching
+// unrealistic risk-taking.
+export const DEFAULT_LEVERAGE = 1;
+export const MAX_LEVERAGE = 20;

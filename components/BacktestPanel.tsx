@@ -11,7 +11,13 @@ import {
 } from 'recharts';
 import { History, Loader2 } from 'lucide-react';
 import { THEME, FONT_SERIF, FONT_MONO, FONT_SANS } from '../lib/theme';
-import { RISK_PRESETS, DEFAULT_START_CASH_FALLBACK, DEFAULT_LOT_OZ } from '../lib/riskPresets';
+import {
+  RISK_PRESETS,
+  DEFAULT_START_CASH_FALLBACK,
+  DEFAULT_LOT_OZ,
+  DEFAULT_LEVERAGE,
+  MAX_LEVERAGE,
+} from '../lib/riskPresets';
 import { runBacktest, type BacktestResult } from '../lib/backtest';
 import { fmtUSD, fmtOz } from '../lib/helpers';
 
@@ -25,6 +31,7 @@ export default function BacktestPanel() {
   const [startCashInput, setStartCashInput] = useState(String(DEFAULT_START_CASH_FALLBACK));
   const [lotOz, setLotOz] = useState(DEFAULT_LOT_OZ);
   const [lotOzInput, setLotOzInput] = useState(String(DEFAULT_LOT_OZ));
+  const [leverage, setLeverage] = useState(DEFAULT_LEVERAGE);
   const [useKelly, setUseKelly] = useState(false);
   const [year, setYear] = useState('all');
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -91,7 +98,7 @@ export default function BacktestPanel() {
           from = Math.floor(new Date(Date.UTC(y, 0, 1)).getTime() / 1000);
           to = Math.floor(new Date(Date.UTC(y + 1, 0, 1)).getTime() / 1000) - 1;
         }
-        const res = runBacktest(dailyHistory, { riskKey, startCash, lotOz, useKelly, from, to });
+        const res = runBacktest(dailyHistory, { riskKey, startCash, lotOz, leverage, useKelly, from, to });
         if (!res) {
           setError(
             year !== 'all'
@@ -108,7 +115,7 @@ export default function BacktestPanel() {
         setRunning(false);
       }
     }, 10);
-  }, [dailyHistory, riskKey, startCash, lotOz, useKelly, year]);
+  }, [dailyHistory, riskKey, startCash, lotOz, leverage, useKelly, year]);
 
   return (
     <div
@@ -232,6 +239,33 @@ export default function BacktestPanel() {
             />
           </div>
           <div>
+            <label
+              style={{ fontSize: '11px', color: THEME.muted, display: 'block', marginBottom: '4px' }}
+              title="1x = full notional in cash. Raising this lets a lot size that would otherwise be unaffordable actually trade, using only a fraction of its value as margin."
+            >
+              Leverage
+            </label>
+            <select
+              value={leverage}
+              onChange={(e) => setLeverage(Number(e.target.value))}
+              style={{
+                background: THEME.panelAlt,
+                color: THEME.text,
+                border: `1px solid ${THEME.hairline}`,
+                borderRadius: '6px',
+                padding: '8px 10px',
+                fontFamily: FONT_MONO,
+                fontSize: '13px',
+              }}
+            >
+              {[1, 2, 5, 10, 20].filter((l) => l <= MAX_LEVERAGE).map((l) => (
+                <option key={l} value={l}>
+                  {l}x
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
             <label style={{ fontSize: '11px', color: THEME.muted, display: 'block', marginBottom: '4px' }}>
               Year
             </label>
@@ -285,12 +319,14 @@ export default function BacktestPanel() {
         </div>
         <div style={{ fontSize: '11px', color: THEME.muted }}>
           Replays the same strategy (technical scoring, the fixed-lot sizing above, optional
-          Kelly, the regime brain, breakeven &amp; trailing stop) against real historical GC=F
-          daily closes. Two honest limits: stop/take-profit checks use daily closes, not intraday
-          highs and lows, and there&apos;s no historical news feed, so this always runs
+          leverage/Kelly, the regime brain, breakeven &amp; trailing stop) against real historical
+          GC=F daily closes. Two honest limits: stop/take-profit checks use daily closes, not
+          intraday highs and lows, and there&apos;s no historical news feed, so this always runs
           math-only. A single position at a time plus a selective entry threshold naturally means
           low trade counts — this is a patient, one-position system, not a high-frequency one, and
-          bigger lot sizes amplify existing swings rather than creating more winning trades.
+          bigger lot sizes or higher leverage amplify existing swings rather than creating more
+          winning trades. At leverage &gt; 1x, a stop-loss also can&apos;t sit looser than the
+          price at which the position&apos;s margin would be fully lost.
         </div>
       </div>
 

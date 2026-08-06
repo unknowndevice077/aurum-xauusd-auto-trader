@@ -33,7 +33,7 @@ import {
   regimeThresholdAdjustment,
   regimeShouldBlock,
 } from './brain';
-import { RISK_PRESETS, RESERVE_FLOOR_PCT, type RiskPresetKey } from './riskPresets';
+import { RISK_PRESETS, RESERVE_FLOOR_PCT, DEFAULT_LEVERAGE, type RiskPresetKey } from './riskPresets';
 import type { Trade } from './types';
 
 const WARMUP_BARS = 50; // computeIndicators needs 50+ closes before it returns real values
@@ -63,6 +63,7 @@ export function runBacktest(
     riskKey: RiskPresetKey | string;
     startCash: number;
     lotOz: number;
+    leverage?: number;
     useKelly?: boolean;
     from?: number;
     to?: number;
@@ -92,6 +93,7 @@ export function runBacktest(
   const anomalies = detectPriceAnomalies(points.slice(Math.max(0, startIdx - WARMUP_BARS)));
 
   const reserveFloor = Math.max(opts.startCash * RESERVE_FLOOR_PCT, 0.01);
+  const leverage = opts.leverage && opts.leverage > 0 ? opts.leverage : DEFAULT_LEVERAGE;
 
   let cash = opts.startCash;
   let oz = 0;
@@ -99,6 +101,7 @@ export function runBacktest(
   let peakPrice: number | null = null;
   let slPrice: number | null = null;
   let tpPrice: number | null = null;
+  let marginUsed: number | null = null;
   let beActive = false;
   let positionThreshold: number | null = null;
   let positionBeTriggerPct: number | null = null;
@@ -137,9 +140,12 @@ export function runBacktest(
       const posBeTriggerPct = positionBeTriggerPct ?? preset.beTriggerPct;
 
       const closePosition = (reasoning: string) => {
-        const proceeds = oz * price;
         const pnl = (price - (entryPrice as number)) * oz;
         const pnlPct = ((price - (entryPrice as number)) / (entryPrice as number)) * 100;
+        // Return the margin committed plus/minus P&L, not oz * price (full
+        // notional) — see liveStep.ts for why crediting full notional back
+        // against a margin-only debit would fabricate leveraged gains.
+        const returned = (marginUsed ?? oz * (entryPrice as number)) + pnl;
         trades.push({
           id: i,
           ts,
@@ -147,17 +153,18 @@ export function runBacktest(
           side: 'SELL',
           price,
           oz,
-          value: proceeds,
+          value: returned,
           pnl,
           pnlPct,
           reasoning,
         });
-        cash += proceeds;
+        cash += Math.max(0, returned);
         oz = 0;
         entryPrice = null;
         peakPrice = null;
         slPrice = null;
         tpPrice = null;
+        marginUsed = null;
         beActive = false;
         positionThreshold = null;
         positionBeTriggerPct = null;
@@ -255,12 +262,12 @@ export function runBacktest(
           const stats = computeTradeStats([...trades].reverse());
           const kelly = kellyFraction(stats.winRate, stats.avgWinPct, stats.avgLossPct, 8, stats.totalTrades);
           if (kelly != null && price > 0) {
-            const kellyOz = (cash * kelly) / price;
+            const kellyOz = (cash * kelly * leverage) / price;
             effectiveLotOz = Math.min(opts.lotOz, kellyOz);
           }
         }
 
-        const sized = calculatePositionSize(cash, effectiveLotOz, price, atr, preset.slPct);
+        const sized = calculatePositionSize(cash, effectiveLotOz, price, atr, preset.slPct, leverage);
         const maxSpend = Math.max(0, cash - reserveFloor);
         const spendScale = sized.spend > 0 ? Math.min(1, maxSpend / sized.spend) : 0;
         const spend = sized.spend * spendScale;
@@ -271,6 +278,7 @@ export function runBacktest(
             matchedRegimeStat && matchedRegimeStat.trades >= 6
               ? ` · brain: ${(matchedRegimeStat.winRate * 100).toFixed(0)}% win in "${regimeNowKey}" (${matchedRegimeStat.trades} past trades)`
               : '';
+          const leverageNote = leverage > 1 ? ` · ${leverage}x, notional $${sized.notional.toFixed(0)}` : '';
           trades.push({
             id: i,
             ts,
@@ -279,15 +287,18 @@ export function runBacktest(
             price,
             oz: ozBought,
             value: spend,
-            reasoning: `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (backtest, math-only)${brainNote}`,
+            reasoning: `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (backtest, math-only)${brainNote}${leverageNote}`,
             regime: regimeNowKey,
           });
           cash -= spend;
           oz += ozBought;
           entryPrice = price;
           peakPrice = price;
-          slPrice = price * (1 - sized.actualSlPct);
+          // Effective stop can never sit looser than the leverage
+          // liquidation floor — see liveStep.ts for the rationale.
+          slPrice = Math.max(price * (1 - sized.actualSlPct), sized.liqPrice);
           tpPrice = price * (1 + preset.tpPct);
+          marginUsed = spend;
           beActive = false;
           positionThreshold = adjustedThreshold;
           positionBeTriggerPct = preset.beTriggerPct;
