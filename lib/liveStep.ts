@@ -104,9 +104,16 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
     adjustedThreshold = Math.min(0.5, adjustedThreshold * (1 + consecutiveLosses * 0.15));
   }
 
-  const regimeNowKey = regimeKey(
-    classifyRegime(regression, rsi, bbWidth, canUseNews ? news!.bias : null)
-  );
+  const regimeNow = classifyRegime(regression, rsi, bbWidth, canUseNews ? news!.bias : null);
+  const regimeNowKey = regimeKey(regimeNow);
+  // Chop filter: classifyRegime already calls a market 'Flat' when the
+  // regression R² < 0.3 (a line that doesn't actually fit the recent price
+  // path) or the slope is too shallow to call a direction. Most of this
+  // bot's losing trades are round-trips inside exactly that condition — RSI
+  // oscillating through 50 with no real trend underneath it. Block new
+  // entries outright when there's no trend to follow; a discretionary
+  // trader wouldn't take a trend-following entry in a range either.
+  const trendConfirmed = regimeNow.trend !== 'Flat';
 
   if (state.botRunning) {
     if (portfolio.oz > 0 && portfolio.entryPrice != null) {
@@ -225,7 +232,7 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
       const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
-      const entrySignalActive = !brainBlocked && combined > adjustedThreshold + regimeAdj;
+      const entrySignalActive = trendConfirmed && !brainBlocked && combined > adjustedThreshold + regimeAdj;
       if (!entrySignalActive) {
         pendingEntrySince = null;
       } else if (pendingEntrySince == null) {

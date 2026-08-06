@@ -120,7 +120,12 @@ export function runBacktest(
     const { ema12, ema26, rsi, atr, bbWidth, macd, macdSignal } = computeIndicators(prices);
     const regression = linearRegression(prices, 20);
     const mrz = zScore(prices, 20);
-    const regimeNowKey = regimeKey(classifyRegime(regression, rsi, bbWidth, null));
+    const regimeNow = classifyRegime(regression, rsi, bbWidth, null);
+    const regimeNowKey = regimeKey(regimeNow);
+    // Chop filter — see liveStep.ts for the rationale: don't take a
+    // trend-following entry when classifyRegime itself can't confirm a
+    // trend (R² < 0.3 or too-shallow slope).
+    const trendConfirmed = regimeNow.trend !== 'Flat';
 
     let adjustedThreshold = preset.threshold;
     if (consecutiveLosses >= 3) {
@@ -231,7 +236,7 @@ export function runBacktest(
       const regimeAdj = regimeThresholdAdjustment(matchedRegimeStat);
       const brainBlocked = regimeShouldBlock(matchedRegimeStat);
 
-      const entrySignalActive = !brainBlocked && tech > adjustedThreshold + regimeAdj;
+      const entrySignalActive = trendConfirmed && !brainBlocked && tech > adjustedThreshold + regimeAdj;
       if (!entrySignalActive) {
         pendingEntrySince = null;
       } else if (pendingEntrySince == null) {

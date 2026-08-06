@@ -460,6 +460,14 @@ export default function AurumTerminal() {
         canUseNews ? newsRef.current?.bias ?? null : null
       );
       const regimeNowKey = regimeKey(regimeNow);
+      // Chop filter: classifyRegime calls the market 'Flat' when the
+      // regression R² < 0.3 (line doesn't fit the recent path) or the slope
+      // is too shallow to call a direction — exactly the condition behind
+      // most observed whipsaw losses (RSI oscillating through 50 with no
+      // real trend underneath). Block new entries when there's no trend to
+      // follow, the same discipline a discretionary trader applies to a
+      // range-bound chart.
+      const trendConfirmed = regimeNow.trend !== 'Flat';
       // A tiny fixed safety rail — not account-size scaling, just prevents
       // a single trade from spending literally all available cash.
       const reserveFloor = Math.max(startCash * RESERVE_FLOOR_PCT, 0.01);
@@ -719,7 +727,8 @@ export default function AurumTerminal() {
           // Signal confirmation: the score has to stay past the threshold
           // for SIGNAL_CONFIRM_MS, not just touch it on one tick, before
           // it's acted on.
-          const entrySignalActive = !brainBlocked && combined > adjustedThreshold + regimeAdj;
+          const entrySignalActive =
+            trendConfirmed && !brainBlocked && combined > adjustedThreshold + regimeAdj;
           const nowMs2 = Date.now();
           if (!entrySignalActive) {
             pendingEntrySinceRef.current = null;
@@ -2061,6 +2070,21 @@ export default function AurumTerminal() {
           ) : (
             <span style={{ fontSize: '11px', color: THEME.muted }}>
               no history yet in this exact condition
+            </span>
+          )}
+          {currentRegime.trend === 'Flat' && (
+            <span
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: '11px',
+                color: THEME.loss,
+                border: `1px solid ${THEME.loss}`,
+                borderRadius: '4px',
+                padding: '2px 6px',
+              }}
+              title="Regression R² is below 0.3 or the slope is too shallow to call a direction — new entries are blocked until a real trend confirms."
+            >
+              chop filter: entries blocked (no confirmed trend)
             </span>
           )}
         </div>
