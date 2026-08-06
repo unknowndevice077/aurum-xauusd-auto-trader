@@ -92,10 +92,49 @@ export function defaultState(startCash: number = DEFAULT_START_CASH_FALLBACK): G
 }
 
 const STATE_KEY = 'aurum:bot-state:v1';
-const REST_URL = process.env.UPSTASH_REDIS_REST_URL;
-const REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// Env values get pasted by hand during setup, and the most common mistakes
+// are mechanical rather than conceptual: surrounding quotes carried over
+// from a .env snippet, stray whitespace/newlines, a trailing slash, or the
+// whole `NAME="value"` line pasted when only the value was wanted. Left
+// alone, those produce an unparseable URL, which makes fetch() throw and
+// surfaces as an opaque 500 with nothing explaining it. Normalizing here is
+// cheap and turns a confusing dead end into a working setup.
+function normalizeEnv(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  let s = raw.trim();
+  // `UPSTASH_REDIS_REST_URL=https://...` pasted whole. Anchored to the known
+  // prefix so it can't chew into a base64 token that happens to contain '='.
+  const linePaste = s.match(/^UPSTASH_[A-Z0-9_]*\s*=\s*(.*)$/);
+  if (linePaste) s = linePaste[1].trim();
+  // Surrounding quotes (neither a URL nor an Upstash token contains one).
+  s = s.replace(/^["']+/, '').replace(/["']+$/, '').trim();
+  return s || undefined;
+}
+
+const REST_URL = normalizeEnv(process.env.UPSTASH_REDIS_REST_URL)?.replace(/\/+$/, '');
+const REST_TOKEN = normalizeEnv(process.env.UPSTASH_REDIS_REST_TOKEN);
 
 export const hasPersistentStore = !!(REST_URL && REST_TOKEN);
+
+// Last failure talking to Upstash, surfaced through /api/state so a
+// misconfigured store shows up as a readable message in the UI instead of
+// silently degrading to in-memory state (which looks identical until the
+// next cold start wipes it).
+let lastStoreError: string | null = null;
+export function getLastStoreError(): string | null {
+  return lastStoreError;
+}
+
+function describeError(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  // fetch() throws this when the URL can't be parsed at all — by far the
+  // likeliest cause is a malformed pasted value, so say so directly.
+  if (/Failed to parse URL|Invalid URL/i.test(msg)) {
+    return `UPSTASH_REDIS_REST_URL is not a valid URL (${msg}). Re-add it as just the https://... value, with no quotes, no variable name, and no trailing slash.`;
+  }
+  return msg;
+}
 
 // Only meaningful within a single warm process (local dev). On Vercel this
 // resets on every cold start when Upstash isn't configured.
@@ -103,21 +142,36 @@ let memoryState: GlobalBotState | null = null;
 
 export async function getState(): Promise<GlobalBotState> {
   if (REST_URL && REST_TOKEN) {
-    const res = await fetch(`${REST_URL}/get/${STATE_KEY}`, {
-      headers: { Authorization: `Bearer ${REST_TOKEN}` },
-      cache: 'no-store',
-    });
-    if (!res.ok) return defaultState();
-    const data = await res.json().catch(() => null);
-    if (data?.result) {
-      try {
-        const parsed = JSON.parse(data.result);
-        return { ...defaultState(parsed.startCash), ...parsed };
-      } catch {
+    try {
+      const res = await fetch(`${REST_URL}/get/${STATE_KEY}`, {
+        headers: { Authorization: `Bearer ${REST_TOKEN}` },
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        lastStoreError =
+          res.status === 401 || res.status === 403
+            ? `Upstash rejected the token (HTTP ${res.status}). Check UPSTASH_REDIS_REST_TOKEN matches this database.`
+            : `Upstash GET failed: HTTP ${res.status}${body ? ` — ${body.slice(0, 200)}` : ''}`;
         return defaultState();
       }
+      const data = await res.json().catch(() => null);
+      lastStoreError = null;
+      if (data?.result) {
+        try {
+          const parsed = JSON.parse(data.result);
+          return { ...defaultState(parsed.startCash), ...parsed };
+        } catch {
+          return defaultState();
+        }
+      }
+      return defaultState();
+    } catch (e: unknown) {
+      // Never let a store problem take the whole endpoint down — fall back
+      // to a fresh in-memory state and report why through /api/state.
+      lastStoreError = describeError(e);
+      return defaultState();
     }
-    return defaultState();
   }
   return memoryState ?? defaultState();
 }
@@ -131,15 +185,28 @@ export async function setState(state: GlobalBotState): Promise<void> {
   };
 
   if (REST_URL && REST_TOKEN) {
-    await fetch(`${REST_URL}/set/${STATE_KEY}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${REST_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(trimmed),
-      cache: 'no-store',
-    });
+    try {
+      const res = await fetch(`${REST_URL}/set/${STATE_KEY}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${REST_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(trimmed),
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        lastStoreError = `Upstash SET failed: HTTP ${res.status}${body ? ` — ${body.slice(0, 200)}` : ''}`;
+      } else {
+        lastStoreError = null;
+      }
+    } catch (e: unknown) {
+      lastStoreError = describeError(e);
+    }
+    // Mirror into memory too, so a single failed write doesn't lose the tick
+    // within a warm process.
+    memoryState = trimmed;
     return;
   }
   memoryState = trimmed;

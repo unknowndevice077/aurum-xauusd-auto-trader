@@ -28,7 +28,9 @@ function timeAgo(ts: number | null): string {
 }
 
 export default function AlwaysOnBot() {
-  const [state, setState] = useState<(GlobalBotState & { persistent: boolean }) | null>(null);
+  const [state, setState] = useState<
+    (GlobalBotState & { persistent: boolean; storeError?: string | null }) | null
+  >(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [startCashInput, setStartCashInput] = useState('10000');
@@ -198,6 +200,32 @@ export default function AlwaysOnBot() {
           </span>
         </div>
       </div>
+
+      {state.storeError && (
+        <div
+          style={{
+            background: THEME.panelAlt,
+            border: `1px solid ${THEME.loss}`,
+            borderRadius: '8px',
+            padding: '12px 14px',
+            fontSize: '12px',
+            color: THEME.text,
+            marginBottom: '20px',
+            display: 'flex',
+            gap: '10px',
+            alignItems: 'flex-start',
+          }}
+        >
+          <AlertTriangle size={16} color={THEME.loss} style={{ flexShrink: 0, marginTop: '1px' }} />
+          <div>
+            <strong>Database configured but not reachable.</strong> The bot is still running on
+            temporary in-memory state, which resets on the next cold start.
+            <div style={{ fontFamily: FONT_MONO, fontSize: '11px', color: THEME.muted, marginTop: '6px' }}>
+              {state.storeError}
+            </div>
+          </div>
+        </div>
+      )}
 
       {(!state.persistent || neverTicked) && (
         <div
