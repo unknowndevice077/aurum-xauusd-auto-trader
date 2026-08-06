@@ -37,3 +37,5 @@ export const RISK_PRESETS: Record<string, RiskPreset> = {
 };
 
 export type RiskPresetKey = keyof typeof RISK_PRESETS;
+
+export const DEFAULT_START_CASH_FALLBACK = 10000;

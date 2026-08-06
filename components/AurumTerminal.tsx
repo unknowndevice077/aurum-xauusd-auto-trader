@@ -61,20 +61,7 @@ import {
   backfillTradePnl,
   fetchNewsAnalysis,
 } from '../lib/helpers';
-
-// ─── Theme ─────────────────────────────────────────────────────────────────
-const THEME = {
-  bg: '#0E0F10',
-  panel: '#17181A',
-  panelAlt: '#1D1E20',
-  hairline: '#2A2B2D',
-  gold: '#C6A15B',
-  goldBright: '#E8C878',
-  text: '#EDEAE0',
-  muted: '#8B8D93',
-  gain: '#5B9279',
-  loss: '#B5533C',
-};
+import { THEME } from '../lib/theme';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 const TICK_MS = 4000;
