@@ -13,6 +13,7 @@ import { Play, Pause, RotateCcw, Radio, AlertTriangle, Newspaper } from 'lucide-
 import { THEME, FONT_SERIF, FONT_MONO, FONT_SANS } from '../lib/theme';
 import { RISK_PRESETS, MAX_LEVERAGE } from '../lib/riskPresets';
 import { fmtUSD, fmtOz } from '../lib/helpers';
+import { markToMarketEquity } from '../lib/quant';
 import type { GlobalBotState } from '../lib/serverState';
 
 const POLL_MS = 5000;
@@ -111,7 +112,16 @@ export default function AlwaysOnBot() {
     );
   }
 
-  const equityValue = state.price != null ? state.portfolio.cash + state.portfolio.oz * state.price : state.portfolio.cash;
+  const equityValue =
+    state.price != null
+      ? markToMarketEquity(
+          state.portfolio.cash,
+          state.portfolio.oz,
+          state.portfolio.entryPrice,
+          state.portfolio.marginUsed,
+          state.price
+        )
+      : state.portfolio.cash;
   const pnl = equityValue - state.startCash;
   const pnlPct = state.startCash > 0 ? (pnl / state.startCash) * 100 : 0;
   const neverTicked = state.lastTickAt == null;

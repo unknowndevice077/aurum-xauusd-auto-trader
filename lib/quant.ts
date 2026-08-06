@@ -321,6 +321,31 @@ export function detectPriceAnomalies(
   return anomalies;
 }
 
+// ─── Mark-to-Market Equity ──────────────────────────────────────────────────
+// The correct way to value an account with an open position is cash + the
+// position's *current worth to the trader* — which, under leverage, is the
+// margin committed plus/minus unrealized P&L, NOT oz * price. `oz * price`
+// is the position's full notional value; cash was only ever debited the
+// margin (a fraction of that notional) when leverage > 1, so adding the
+// full notional back on top of already-reduced cash double-counts the
+// leveraged (borrowed) portion — the equity curve would spike by exactly
+// that borrowed amount for as long as the position stays open, then snap
+// back down the instant it closes (since realized P&L accounting is
+// correct). At 1x leverage margin === notional, so this collapses to the
+// original cash + oz * price with no behavior change.
+export function markToMarketEquity(
+  cash: number,
+  oz: number,
+  entryPrice: number | null,
+  marginUsed: number | null,
+  price: number
+): number {
+  if (oz <= 0 || entryPrice == null) return cash;
+  const unrealizedPnl = (price - entryPrice) * oz;
+  const committed = marginUsed ?? oz * entryPrice; // fallback for pre-leverage saved state
+  return cash + committed + unrealizedPnl;
+}
+
 // ─── Kelly Criterion ─────────────────────────────────────────────────────
 // f* = W - (1-W)/R, where W = win rate, R = avg win / avg loss.
 // Full Kelly is aggressive and assumes stationary edge; we return a

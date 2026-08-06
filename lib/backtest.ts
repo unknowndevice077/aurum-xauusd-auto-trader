@@ -23,6 +23,7 @@ import {
   annualizedRiskStats,
   winRateConfidenceInterval,
   detectPriceAnomalies,
+  markToMarketEquity,
   type TradeStats,
   type PriceAnomaly,
 } from './quant';
@@ -307,11 +308,11 @@ export function runBacktest(
       }
     }
 
-    equityCurve.push({ t: ts, value: cash + oz * price });
+    equityCurve.push({ t: ts, value: markToMarketEquity(cash, oz, entryPrice, marginUsed, price) });
   }
 
   const finalPrice = points[points.length - 1].p;
-  const finalEquity = cash + oz * finalPrice;
+  const finalEquity = markToMarketEquity(cash, oz, entryPrice, marginUsed, finalPrice);
   const totalReturnPct = ((finalEquity - opts.startCash) / opts.startCash) * 100;
   const tradesDesc = [...trades].reverse(); // newest-first, matches live ledger
 

@@ -12,6 +12,7 @@ import {
   kellyFraction,
   computeTradeStats,
   newsEffectiveWeight,
+  markToMarketEquity,
 } from './quant';
 import {
   classifyRegime,
@@ -313,7 +314,10 @@ export async function runOneTick(state: GlobalBotState): Promise<GlobalBotState>
 
   const equityCurve = [
     ...state.equityCurve,
-    { t: now, value: portfolio.cash + portfolio.oz * nextPrice },
+    {
+      t: now,
+      value: markToMarketEquity(portfolio.cash, portfolio.oz, portfolio.entryPrice, portfolio.marginUsed, nextPrice),
+    },
   ];
 
   return {

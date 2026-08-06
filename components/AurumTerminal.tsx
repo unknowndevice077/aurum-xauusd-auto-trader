@@ -41,6 +41,7 @@ import {
   computeTradeStats,
   kellyFraction,
   trendSummary,
+  markToMarketEquity,
 } from '../lib/quant';
 import {
   classifyRegime,
@@ -854,7 +855,13 @@ export default function AurumTerminal() {
 
       const finalPortfolio = portfolioRef.current;
       setEquityCurve((eq) => {
-        const val = finalPortfolio.cash + finalPortfolio.oz * nextPrice;
+        const val = markToMarketEquity(
+          finalPortfolio.cash,
+          finalPortfolio.oz,
+          finalPortfolio.entryPrice,
+          finalPortfolio.marginUsed,
+          nextPrice
+        );
         return [...eq, { t: eq.length, value: val }].slice(-150);
       });
     }, TICK_MS);
@@ -991,7 +998,9 @@ export default function AurumTerminal() {
     [dailyHistory]
   );
 
-  const equityValue = price ? portfolio.cash + portfolio.oz * price : portfolio.cash;
+  const equityValue = price
+    ? markToMarketEquity(portfolio.cash, portfolio.oz, portfolio.entryPrice, portfolio.marginUsed, price)
+    : portfolio.cash;
   const pnl = equityValue - startCash;
   const pnlPct = startCash > 0 ? (pnl / startCash) * 100 : 0;
   const biasColor =

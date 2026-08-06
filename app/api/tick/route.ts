@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getState, setState, hasPersistentStore } from '../../../lib/serverState';
 import { runOneTick } from '../../../lib/liveStep';
+import { markToMarketEquity } from '../../../lib/quant';
 
 // Never statically optimize/cache this route — every call must do real work.
 export const dynamic = 'force-dynamic';
@@ -26,7 +27,16 @@ async function handleTick(req: NextRequest) {
       persistent: hasPersistentStore,
       price: next.price,
       dataSourceLabel: next.dataSourceLabel,
-      equity: next.price != null ? next.portfolio.cash + next.portfolio.oz * next.price : next.portfolio.cash,
+      equity:
+        next.price != null
+          ? markToMarketEquity(
+              next.portfolio.cash,
+              next.portfolio.oz,
+              next.portfolio.entryPrice,
+              next.portfolio.marginUsed,
+              next.price
+            )
+          : next.portfolio.cash,
       botRunning: next.botRunning,
       tradeCount: next.portfolio.trades.length,
       ts: next.lastTickAt,
