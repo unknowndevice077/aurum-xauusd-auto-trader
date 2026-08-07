@@ -101,6 +101,13 @@ const DEFAULT_START_CASH = 10000;
 const MIN_START_CASH = 1;
 const MAX_START_CASH = 10_000_000;
 
+function formatAge(seconds: number): string {
+  if (seconds < 90) return `${seconds}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 172800) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
 const FONT_SERIF = "'Source Serif 4', Georgia, serif";
 const FONT_MONO = "'JetBrains Mono', 'Courier New', monospace";
 const FONT_SANS = "'Inter', -apple-system, sans-serif";
@@ -1054,11 +1061,15 @@ export default function AurumTerminal() {
       : news?.bias === 'bearish'
         ? TrendingDown
         : Minus;
-  const lastBarTime =
-    priceHistory.length > 0
-      ? new Date(priceHistory[priceHistory.length - 1].t * 1000).toLocaleTimeString()
-      : '';
-  const marketOpen = marketState === 'REGULAR';
+  const lastBar = priceHistory.length > 0 ? priceHistory[priceHistory.length - 1] : null;
+  const lastBarTime = lastBar ? new Date(lastBar.t * 1000).toLocaleTimeString() : '';
+  // Yahoo often omits marketState entirely, so liveness is judged from the
+  // data itself: if the newest closed bar is more than a few minutes old,
+  // nothing is printing. Without this a closed market looks like a frozen or
+  // broken app rather than a shut exchange.
+  const lastBarAgeSec = lastBar ? Math.floor(Date.now() / 1000) - lastBar.t : null;
+  const marketOpen =
+    marketState === 'REGULAR' || (lastBarAgeSec != null && lastBarAgeSec < 300);
 
   const activeGroupSize =
     INTRADAY_TIMEFRAMES.find((t) => t.key === timeframe)?.groupSize ?? 1;
@@ -1110,7 +1121,7 @@ export default function AurumTerminal() {
           <div style={{ fontSize: '12px', color: THEME.muted, marginTop: '2px' }}>
             Paper-trading terminal &middot; XAU/USD &middot; {dataSourceLabel}
           </div>
-          {marketState && (
+          {lastBar && (
             <div
               style={{
                 fontSize: '11px',
@@ -1120,8 +1131,8 @@ export default function AurumTerminal() {
               }}
             >
               {marketOpen
-                ? `Market open · ${priceHistory.length} bars today · last ${lastBarTime}`
-                : `Market ${(marketState || 'closed').toLowerCase()} — price is static until it reopens, so the bot will sit idle`}
+                ? `Market open · ${priceHistory.length} closed bars · last ${lastBarTime}`
+                : `Market closed — newest bar is ${formatAge(lastBarAgeSec ?? 0)} old. No new prints, so the bot stays idle until it reopens.`}
             </div>
           )}
         </div>
