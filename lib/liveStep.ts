@@ -40,26 +40,52 @@ const EXIT_COOLDOWN_MS = 5 * 60_000;
 const SIGNAL_CONFIRM_MS = 60_000;
 const FALLBACK_PRICE = 4000;
 
+// Prices come from Yahoo Finance's GC=F (COMEX gold futures) chart endpoint —
+// the same source /api/history already uses for the backtest, so the live bot
+// and the backtest are priced off one feed rather than two that can disagree.
+//
+// This previously used api.metals.live, which has since stopped responding
+// entirely (TLS handshake failure). Because the failure was caught and
+// swallowed into the random-walk fallback below, the bot kept "working" while
+// quietly trading synthetic prices — the label was the only clue. That
+// fallback is still here (an unattended cron shouldn't die on one bad
+// response), but it is now clearly labelled as not-real so it can't be
+// mistaken for live data in the UI.
 async function fetchLivePrice(lastPrice: number | null): Promise<{ price: number; label: string }> {
   try {
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 4000);
-    const res = await fetch('https://api.metals.live/v1/spot/gold', {
-      signal: controller.signal,
-      cache: 'no-store',
-    });
+    const t = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(
+      'https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m',
+      {
+        signal: controller.signal,
+        cache: 'no-store',
+        // Yahoo rejects requests without a browser-ish User-Agent.
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AurumTerminal/1.0)' },
+      }
+    );
     clearTimeout(t);
+    if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
     const json = await res.json();
-    const last = Array.isArray(json) ? json[json.length - 1] : null;
-    const seed = last ? Number(last[1] ?? last.price) : null;
-    if (seed && seed > 100 && seed < 100000) {
-      return { price: seed, label: 'Live spot (metals.live)' };
+    const meta = json?.chart?.result?.[0]?.meta;
+
+    // Prefer the live quote; fall back to the last close so the bot still
+    // gets a real number outside futures trading hours.
+    const live = Number(meta?.regularMarketPrice);
+    const prevClose = Number(meta?.chartPreviousClose ?? meta?.previousClose);
+    const price = Number.isFinite(live) && live > 0 ? live : prevClose;
+
+    if (Number.isFinite(price) && price > 100 && price < 100000) {
+      return { price, label: 'Live COMEX gold futures (Yahoo GC=F)' };
     }
-    throw new Error('bad seed');
+    throw new Error('no usable price in Yahoo response');
   } catch {
     const base = lastPrice ?? FALLBACK_PRICE;
     const noise = (Math.random() - 0.5) * 0.004;
-    return { price: Math.max(1, base * (1 + noise)), label: 'Simulated (live feed unavailable)' };
+    return {
+      price: Math.max(1, base * (1 + noise)),
+      label: 'NOT REAL — synthetic prices, live feed unreachable',
+    };
   }
 }
 
