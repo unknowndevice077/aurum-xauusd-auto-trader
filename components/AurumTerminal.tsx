@@ -28,7 +28,7 @@ import {
   Brain,
   AlertTriangle,
 } from 'lucide-react';
-import PriceChart, { DAILY_TIMEFRAMES, TimeframeKey } from './PriceChart';
+import PriceChart, { INTRADAY_TIMEFRAMES, TimeframeKey } from './PriceChart';
 import {
   computeIndicators,
   technicalScore,
@@ -63,51 +63,36 @@ import {
 import { THEME } from '../lib/theme';
 
 // ─── Constants ─────────────────────────────────────────────────────────────
-// This tab replays real GC=F daily bars in fast-forward. It used to generate
-// a random walk instead, which was wrong in two compounding ways:
+// This tab trades the real market in real time, on live 1-minute GC=F bars.
+// Testing the same logic over a past period is the Backtest tab's job.
+//
+// It used to generate a random walk instead, which was wrong in two
+// compounding ways (both measured against the real strategy modules):
 //
 //  1. Volatility. `(Math.random() - 0.5) * 0.004` per 12s tick is a 0.1155%
-//     per-tick sd, which compounds to ~9.8% per simulated day — about 10x
-//     real gold's ~1%/day. The strategy's SL/TP percentages are calibrated
-//     for daily gold bars, so they never matched the feed they ran on.
+//     per-tick sd, compounding to ~9.8% per simulated day — about 10x real
+//     gold's ~1%/day. The SL/TP percentages never matched their own feed.
 //  2. Structure. A driftless random walk contains no trend by construction,
-//     so a trend-following strategy has literally nothing to detect.
-//     Measured net P&L was ~$0 on $10,000 at every volatility setting — the
-//     bot wasn't losing, it was being asked to find signal in pure noise.
+//     so a trend-following strategy has nothing to detect. Net P&L measured
+//     ~$0 on $10,000 at every volatility setting — the bot wasn't losing, it
+//     was being asked to find signal in pure noise.
 //
-// The visible symptom was constant whipsawing: because MIN_HOLD was only 3
-// ticks (~0.2% of drift) while the stop-loss sat at 1.2%, the signal-exit
-// condition was always reachable ~6x sooner than any stop, so essentially
-// every exit was a signal flip-flop rather than a real risk event.
-//
-// Replaying real bars fixes both, and lines this tab up with the Backtest
-// tab — same GC=F series, same rules, same warmup — so watching a period
-// here and backtesting it should agree closely. Not bit-identical, though:
-// the backtest measures its cooldown in calendar seconds (2 * 86400) while
-// this counts bars, so across a weekend or market holiday one can release a
-// bar earlier than the other.
+// The visible symptom was constant whipsawing: with MIN_HOLD at 3 ticks
+// (~0.2% of drift) but the stop-loss at 1.2%, the signal-exit condition was
+// always reachable ~6x sooner than any stop, so essentially every exit was a
+// signal flip-flop rather than a real risk event (measured: 130 signal exits
+// vs 0 stop-losses on Aggressive).
 
-// One bar of history is consumed per interval. This controls only playback
-// speed, never strategy behaviour — all trading rules below are counted in
-// BARS, so results are identical no matter how fast you watch.
-const REPLAY_SPEEDS = [
-  { key: 'slow', label: '1 bar / 2s', ms: 2000 },
-  { key: 'normal', label: '1 bar / 1s', ms: 1000 },
-  { key: 'fast', label: '4 bars / s', ms: 250 },
-  { key: 'turbo', label: '20 bars / s', ms: 50 },
-] as const;
-type ReplaySpeedKey = (typeof REPLAY_SPEEDS)[number]['key'];
-const DEFAULT_REPLAY_SPEED: ReplaySpeedKey = 'normal';
+// Real 1-minute bars, so polling faster just re-reads the same bar. The tick
+// body ignores a repeated timestamp rather than manufacturing movement the
+// market didn't make.
+const LIVE_POLL_MS = 60_000;
 
 const HISTORY_CAP = 5000;
-// Bars of real history fed to the indicators before the replay's first
-// tradeable bar, so EMA26/RSI14/regression-20 are warm rather than
-// stabilising during the first trades. Matches the backtest's WARMUP_BARS.
-const WARMUP_BARS = 50;
-// Whipsaw controls, counted in BARS to match lib/backtest.ts exactly
-// (which uses 1 day and 2 days respectively against the same daily series).
-// Expressing these in bars rather than milliseconds is what makes replay
-// speed a pure display concern.
+// Whipsaw controls, counted in BARS rather than wall-clock so they track
+// actual market activity: when the market is quiet and prints no new bar,
+// no time passes as far as the strategy is concerned. One bar is one minute
+// here, against lib/backtest.ts's one day — same rule, different granularity.
 const SIGNAL_CONFIRM_BARS = 1;
 const EXIT_COOLDOWN_BARS = 2;
 const TECH_WEIGHT = 0.55;
@@ -176,10 +161,11 @@ export default function AurumTerminal() {
   // ─── Replay ───────────────────────────────────────────────────────────
   // The full daily series being replayed, the cursor into it, and playback
   // speed. `replayDone` latches when the cursor reaches the end.
-  const [replaySpeed, setReplaySpeed] = useState<ReplaySpeedKey>(DEFAULT_REPLAY_SPEED);
-  const [replayIdx, setReplayIdx] = useState(0);
-  const [replayDone, setReplayDone] = useState(false);
-  const [replayYear, setReplayYear] = useState('all');
+  // 'REGULAR' while the pit is open, 'CLOSED'/'PRE'/'POST' otherwise — used
+  // to explain a flat chart rather than letting it look broken.
+  const [marketState, setMarketState] = useState<string | null>(null);
+  // Bumped to force a re-seed of the live bar buffer from /api/live.
+  const [reseedNonce, setReseedNonce] = useState(0);
   const [providerKey, setProviderKey] = useState<ProviderKey>('openai');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(PROVIDER_META.openai.defaultModel);
@@ -199,10 +185,6 @@ export default function AurumTerminal() {
   const pendingEntryBarRef = useRef<number | null>(null); // signal confirmation
   const pendingExitBarRef = useRef<number | null>(null);
   const entryBarRef = useRef<number | null>(null);
-  // The series being replayed and the cursor into it, held as refs so the
-  // interval body reads current values without re-subscribing every bar.
-  const replaySeriesRef = useRef<{ t: number; p: number }[]>([]);
-  const replayIdxRef = useRef(0);
 
   // ─── Persisted State Loading ───────────────────────────────────────────
   useEffect(() => {
@@ -279,20 +261,15 @@ export default function AurumTerminal() {
           setMathOnly(false);
         }
       }
-      // The price series is no longer persisted — it's a deterministic
-      // replay of real history, so it's rebuilt from /api/history on load
-      // rather than restored. Clear any buffer saved by an older build,
-      // which held synthetic random-walk ticks that would now be mixed in
-      // with real bars.
+      // The price series is no longer persisted — it's the live market, so
+      // it's re-seeded from /api/live on load rather than restored. Clear any
+      // buffer saved by an older build, which held synthetic random-walk
+      // ticks that would otherwise be mixed in with real bars.
       localStorage.removeItem('aurum-price-history');
-      const storedYear = localStorage.getItem('aurum-replay-year');
-      if (storedYear) setReplayYear(storedYear);
-      const storedSpeed = localStorage.getItem('aurum-replay-speed');
-      if (storedSpeed && REPLAY_SPEEDS.some((s) => s.key === storedSpeed)) {
-        setReplaySpeed(storedSpeed as ReplaySpeedKey);
-      }
+      localStorage.removeItem('aurum-replay-year');
+      localStorage.removeItem('aurum-replay-speed');
       const storedTf = localStorage.getItem('aurum-timeframe');
-      if (storedTf && DAILY_TIMEFRAMES.some((t) => t.key === storedTf)) {
+      if (storedTf && INTRADAY_TIMEFRAMES.some((t) => t.key === storedTf)) {
         setTimeframe(storedTf as TimeframeKey);
       }
     } catch (e) {
@@ -349,68 +326,9 @@ export default function AurumTerminal() {
     localStorage.setItem('aurum-timeframe', timeframe);
   }, [timeframe, loaded]);
 
-  useEffect(() => {
-    if (!loaded) return;
-    localStorage.setItem('aurum-replay-year', replayYear);
-  }, [replayYear, loaded]);
-
-  useEffect(() => {
-    if (!loaded) return;
-    localStorage.setItem('aurum-replay-speed', replaySpeed);
-  }, [replaySpeed, loaded]);
-
-  // ─── Replay Setup ────────────────────────────────────────────────────────
-  // Positions the cursor at the start of the selected window and seeds the
-  // indicator buffer with the WARMUP_BARS immediately preceding it, so EMA26
-  // / RSI14 / regression-20 are already warm on the first tradeable bar
-  // rather than stabilising during the first few trades. This mirrors how
-  // lib/backtest.ts keeps real preceding history for warmup even when a
-  // mid-range start date is chosen.
-  const armReplay = useCallback(
-    (series: { t: number; p: number }[], year: string) => {
-      if (series.length === 0) return;
-
-      let startIdx = WARMUP_BARS;
-      if (year !== 'all') {
-        const y = parseInt(year, 10);
-        const from = Math.floor(Date.UTC(y, 0, 1) / 1000);
-        const found = series.findIndex((pt) => pt.t >= from);
-        if (found >= 0) startIdx = Math.max(WARMUP_BARS, found);
-      }
-      if (startIdx >= series.length) startIdx = Math.max(WARMUP_BARS, series.length - 1);
-
-      const warmup = series.slice(Math.max(0, startIdx - WARMUP_BARS), startIdx);
-      replaySeriesRef.current = series;
-      replayIdxRef.current = startIdx;
-      barIndexRef.current = 0;
-      lastExitBarRef.current = null;
-      pendingEntryBarRef.current = null;
-      pendingExitBarRef.current = null;
-      entryBarRef.current = null;
-
-      historyRef.current = warmup;
-      setPriceHistory(warmup);
-      setReplayIdx(startIdx);
-      setReplayDone(false);
-
-      const seedPrice = warmup.length ? warmup[warmup.length - 1].p : series[startIdx].p;
-      priceRef.current = seedPrice;
-      setPrice(seedPrice);
-
-      const startDate = new Date(series[startIdx].t * 1000).toLocaleDateString();
-      const endDate = new Date(series[series.length - 1].t * 1000).toLocaleDateString();
-      setDataSourceLabel(
-        `Replaying real GC=F daily bars · ${startDate} → ${endDate} (${series.length - startIdx} bars)`
-      );
-    },
-    []
-  );
-
-  // ─── Daily History (for week/month market memory) ──────────────────────
-  // Fetched independently of the resumed-session check above so the
-  // monitoring panel always has real week/month context, even when the live
-  // tick buffer was restored from localStorage. (The Backtest tab fetches
-  // its own copy — it lives in its own component now.)
+  // ─── Daily History (for the week/month market memory panel) ─────────────
+  // Long-range daily context only — the trading feed itself is the live
+  // 1-minute series below. (The Backtest tab fetches its own copy.)
   useEffect(() => {
     if (!loaded) return;
     let cancelled = false;
@@ -420,21 +338,56 @@ export default function AurumTerminal() {
         const json = await res.json();
         if (!cancelled && !json.error && Array.isArray(json.points) && json.points.length > 0) {
           setDailyHistory(json.points);
-          armReplay(json.points, replayYear);
         }
       } catch {
-        if (!cancelled) {
-          setDataSourceLabel('Could not load GC=F history — replay unavailable.');
-        }
+        // Non-critical — only the memory panel needs this.
       }
     })();
     return () => {
       cancelled = true;
     };
-    // replayYear intentionally omitted: changing it re-arms via its own
-    // handler rather than refetching 25 years of history.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, armReplay]);
+  }, [loaded]);
+
+  // ─── Live Feed Setup ────────────────────────────────────────────────────
+  // Seeds the indicator buffer with real 1-minute GC=F bars so EMA26/RSI14/
+  // regression-20 are warm immediately, then the tick loop appends each new
+  // minute from the same series. Seeding and ticking share one granularity
+  // on purpose — mixing daily seed bars with sub-minute appends is what made
+  // the old build's indicators meaningless.
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    (async () => {
+      setDataSourceLabel('Loading live gold feed…');
+      try {
+        const res = await fetch('/api/live', { cache: 'no-store' });
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.error || !Array.isArray(json.points) || json.points.length === 0) {
+          setDataSourceLabel(`Live gold feed unavailable: ${json.error ?? 'no data'}`);
+          return;
+        }
+        const points: { t: number; p: number }[] = json.points;
+        barIndexRef.current = 0;
+        lastExitBarRef.current = null;
+        pendingEntryBarRef.current = null;
+        pendingExitBarRef.current = null;
+        entryBarRef.current = null;
+        historyRef.current = points;
+        setPriceHistory(points);
+        const last = json.price ?? points[points.length - 1].p;
+        priceRef.current = last;
+        setPrice(last);
+        setMarketState(json.marketState ?? null);
+        setDataSourceLabel(`Live COMEX gold (GC=F) · real 1-minute bars · ${points.length} today`);
+      } catch {
+        if (!cancelled) setDataSourceLabel('Live gold feed unreachable.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loaded, reseedNonce]);
 
   // ─── News ────────────────────────────────────────────────────────────────
   const canUseNews = !mathOnly;
@@ -466,40 +419,66 @@ export default function AurumTerminal() {
     return () => clearInterval(id);
   }, [runNewsRefresh, canUseNews]);
 
-  // ─── Bot Tick (one replayed bar per interval) ────────────────────────────
+  // ─── Bot Tick (one live bar per poll) ────────────────────────────────────
+  // Polls the real 1-minute GC=F feed and advances only when the market has
+  // actually printed a new bar.
   useEffect(() => {
     if (price === null) return;
-    const speedMs =
-      REPLAY_SPEEDS.find((s) => s.key === replaySpeed)?.ms ?? REPLAY_SPEEDS[1].ms;
-    const id = setInterval(() => {
-      const series = replaySeriesRef.current;
-      const idx = replayIdxRef.current;
-      if (series.length === 0) return;
-      if (idx >= series.length) {
-        // Reached the end of available history — stop rather than loop, so
-        // the equity curve reflects one honest pass over the period.
-        setReplayDone(true);
-        setBotRunning(false);
+
+    const id = setInterval(async () => {
+      let json: {
+        price?: number;
+        points?: { t: number; p: number }[];
+        marketState?: string;
+        error?: string;
+      };
+      try {
+        const res = await fetch('/api/live', { cache: 'no-store' });
+        json = await res.json();
+      } catch {
+        setDataSourceLabel('Live gold feed unreachable — retrying.');
+        return;
+      }
+      if (json.error || !json.points?.length) {
+        setDataSourceLabel(`Live gold feed error: ${json.error ?? 'no data'}`);
         return;
       }
 
-      const bar = series[idx];
-      const nextPrice = bar.p;
-      const nowSec = bar.t;
-      replayIdxRef.current = idx + 1;
+      setMarketState(json.marketState ?? null);
+      const newest = json.points[json.points.length - 1];
+      const lastT = historyRef.current.length
+        ? historyRef.current[historyRef.current.length - 1].t
+        : 0;
+      // Gold futures don't print every minute, and outside trading hours they
+      // don't print at all. No new bar means genuinely nothing happened —
+      // advancing on a repeated price would manufacture movement the market
+      // didn't make, and would also let the bar-counted cooldown/confirmation
+      // windows expire while the market sat still.
+      if (newest.t <= lastT) {
+        const shown = json.price ?? newest.p;
+        setPrice(shown);
+        priceRef.current = shown;
+        return;
+      }
+
+      const nextPrice = newest.p;
+      const nowSec = newest.t;
+
+      // Live news against a live bar is contemporaneous, so it legitimately
+      // informs the score here (unlike the Backtest tab, which is math-only
+      // because scoring a past bar with today's headlines is look-ahead bias).
+      let sentiment = 0;
+      if (canUseNews && newsRef.current) {
+        const w = newsEffectiveWeight(
+          Date.now() - newsRef.current.ts,
+          newsRef.current.confidence
+        );
+        sentiment = newsRef.current.sentiment_score * w;
+      }
+
       barIndexRef.current += 1;
-      setReplayIdx(idx + 1);
       priceRef.current = nextPrice;
       setPrice(nextPrice);
-
-      // Replayed bars are historical, so today's news cannot have moved them
-      // and must not influence decisions about them — applying a current
-      // headline to a 2019 bar would be pure look-ahead nonsense. The news
-      // panel still fetches and displays the live read as information; it
-      // just doesn't feed the score here. This matches lib/backtest.ts,
-      // which is math-only for the same reason. Note the score below is
-      // plain `tech`, NOT `TECH_WEIGHT * tech + NEWS_WEIGHT * 0` — the
-      // latter would silently scale every score by 0.55 and suppress entries.
 
       const nextHistory = [...historyRef.current, { t: nowSec, p: nextPrice }].slice(
         -HISTORY_CAP
@@ -518,10 +497,16 @@ export default function AurumTerminal() {
       // bucket and look up how the bot's own past trades performed in that
       // exact bucket, so it can lean into conditions that have worked and
       // pull back (or refuse to trade) in conditions that historically haven't.
-      // News bias is deliberately null here too — the regime bucket a trade
-      // is filed under has to describe the market at that historical bar, not
-      // today's headlines, or the brain would learn from mislabelled buckets.
-      const regimeNow = classifyRegime(regression, rsi, bbWidth, null);
+      // In replay the news bias is forced to null: the regime bucket a trade
+      // is filed under must describe the market at that historical bar, not
+      // today's headlines, or the brain learns from mislabelled buckets.
+      // Live bars are contemporaneous with the news, so it applies there.
+      const regimeNow = classifyRegime(
+        regression,
+        rsi,
+        bbWidth,
+        canUseNews ? newsRef.current?.bias ?? null : null
+      );
       const regimeNowKey = regimeKey(regimeNow);
       // Chop filter: classifyRegime calls the market 'Flat' when the
       // regression R² < 0.3 (line doesn't fit the recent path) or the slope
@@ -697,7 +682,10 @@ export default function AurumTerminal() {
               regression,
               mrz
             );
-            const combined = tech;
+            // `sentiment` is 0 in replay, so this reduces to plain `tech`
+            // there rather than scaling it down by NEWS_WEIGHT.
+            const combined =
+              sentiment !== 0 ? TECH_WEIGHT * tech + NEWS_WEIGHT * sentiment : tech;
             // Bar-counted, matching lib/backtest.ts: a signal exit needs the
             // score to stay past the threshold for SIGNAL_CONFIRM_BARS, and
             // the position to have existed for at least one prior bar.
@@ -715,7 +703,10 @@ export default function AurumTerminal() {
               bar - pendingExitBarRef.current >= SIGNAL_CONFIRM_BARS;
             if (heldBars >= 1 && exitConfirmed) {
               const liveCur = portfolioRef.current;
-              const reasoning = `Downtrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (replay, math-only)`;
+              const reasoning =
+                sentiment !== 0
+                  ? `${tech <= 0 ? 'Downtrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment < 0 ? 'negative' : 'cooling'}`
+                  : `Downtrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (live, math-only)`;
               const pnl = (nextPrice - liveCur.entryPrice!) * liveCur.oz;
               const pnlPct = ((nextPrice - liveCur.entryPrice!) / liveCur.entryPrice!) * 100;
               const returned = (liveCur.marginUsed ?? liveCur.oz * liveCur.entryPrice!) + pnl;
@@ -783,7 +774,8 @@ export default function AurumTerminal() {
             regression,
             mrz
           );
-          const combined = tech;
+          const combined =
+            sentiment !== 0 ? TECH_WEIGHT * tech + NEWS_WEIGHT * sentiment : tech;
 
           // Brain lookup: has this exact market regime historically been a
           // winner or a loser for this bot's own trades?
@@ -856,7 +848,10 @@ export default function AurumTerminal() {
               // be tighter than the preset's own stop-loss %.
               const slPrice = Math.max(nextPrice * (1 - actualSlPct), sized.liqPrice);
               const tpPrice = nextPrice * (1 + preset.tpPct);
-              const reasoning = `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (replay, math-only)`;
+              const reasoning =
+                sentiment !== 0
+                  ? `${tech >= 0 ? 'Uptrend' : 'Mixed trend'}, RSI ${rsi ? rsi.toFixed(0) : '--'}, news ${sentiment >= 0 ? 'supportive' : 'cautious'}${newsRef.current?.key_driver ? ' (' + newsRef.current.key_driver + ')' : ''}`
+                  : `Uptrend signal, RSI ${rsi ? rsi.toFixed(0) : '--'} (live, math-only)`;
               const brainNote =
                 matchedRegimeStat && matchedRegimeStat.trades >= 6
                   ? ` · brain: ${(matchedRegimeStat.winRate * 100).toFixed(0)}% win in "${regimeNowKey}" (${matchedRegimeStat.trades} past trades)`
@@ -886,7 +881,7 @@ export default function AurumTerminal() {
                 beActive: false,
                 positionThreshold: adjustedThreshold,
                 positionBeTriggerPct: preset.beTriggerPct,
-                positionUsesNews: false,
+                positionUsesNews: sentiment !== 0,
                 marginUsed: spend,
                 trades: [trade, ...cur.trades].slice(0, 100),
               };
@@ -909,9 +904,9 @@ export default function AurumTerminal() {
         );
         return [...eq, { t: eq.length, value: val }].slice(-150);
       });
-    }, speedMs);
+    }, LIVE_POLL_MS);
     return () => clearInterval(id);
-  }, [price, botRunning, riskKey, canUseNews, startCash, lotOz, leverage, useKelly, replaySpeed]);
+  }, [price, botRunning, riskKey, canUseNews, startCash, lotOz, leverage, useKelly]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────
   const handleReset = useCallback(
@@ -942,27 +937,8 @@ export default function AurumTerminal() {
       pendingExitBarRef.current = null;
       entryBarRef.current = null;
       localStorage.setItem('aurum-portfolio', JSON.stringify(fresh));
-      // Rewind the replay too — otherwise a "reset" portfolio would resume
-      // mid-period against indicators warmed by the run it just discarded.
-      if (replaySeriesRef.current.length > 0) {
-        armReplay(replaySeriesRef.current, replayYear);
-      }
     },
-    [startCash, armReplay, replayYear]
-  );
-
-  // Re-arm at a different point in history. Also clears the portfolio, since
-  // carrying trades from one period into another would make the equity curve
-  // meaningless.
-  const handleReplayYearChange = useCallback(
-    (year: string) => {
-      setReplayYear(year);
-      setBotRunning(false);
-      if (replaySeriesRef.current.length > 0) {
-        armReplay(replaySeriesRef.current, year);
-      }
-    },
-    [armReplay]
+    [startCash]
   );
 
   const handleApplyStartCash = useCallback(() => {
@@ -987,14 +963,12 @@ export default function AurumTerminal() {
     setLotOz(val);
   }, [lotOzInput, lotOz]);
 
-  // Rewind the replay to the start of the selected window without touching
-  // the portfolio.
+  // Re-seed the chart from the live feed, discarding the current bar buffer
+  // without touching the portfolio. Useful after a feed outage has left a gap.
   const handleResetChart = useCallback(() => {
     setBotRunning(false);
-    if (replaySeriesRef.current.length > 0) {
-      armReplay(replaySeriesRef.current, replayYear);
-    }
-  }, [armReplay, replayYear]);
+    setReseedNonce((n) => n + 1);
+  }, []);
 
   const handleProviderChange = useCallback((key: ProviderKey) => {
     setProviderKey(key);
@@ -1080,25 +1054,14 @@ export default function AurumTerminal() {
       : news?.bias === 'bearish'
         ? TrendingDown
         : Minus;
-  // Replay progress. replayIdx is the cursor into the full series; the
-  // replay's own start is wherever armReplay put it, so bars-done is measured
-  // from there rather than from index 0.
-  const replayStartIdx = replayIdx - (priceHistory.length - WARMUP_BARS);
-  const replayTotalBars = dailyHistory.length > 0 ? dailyHistory.length - replayStartIdx : 0;
-  const replayBarsDone = Math.max(0, priceHistory.length - WARMUP_BARS);
-  const currentBarDate =
+  const lastBarTime =
     priceHistory.length > 0
-      ? new Date(priceHistory[priceHistory.length - 1].t * 1000).toLocaleDateString()
+      ? new Date(priceHistory[priceHistory.length - 1].t * 1000).toLocaleTimeString()
       : '';
-
-  const availableReplayYears = useMemo(() => {
-    const years = new Set<number>();
-    for (const pt of dailyHistory) years.add(new Date(pt.t * 1000).getUTCFullYear());
-    return Array.from(years).sort((a, b) => b - a);
-  }, [dailyHistory]);
+  const marketOpen = marketState === 'REGULAR';
 
   const activeGroupSize =
-    DAILY_TIMEFRAMES.find((t) => t.key === timeframe)?.groupSize ?? 1;
+    INTRADAY_TIMEFRAMES.find((t) => t.key === timeframe)?.groupSize ?? 1;
   const candles = useMemo(
     () => buildCandles(priceHistory, activeGroupSize),
     [priceHistory, activeGroupSize]
@@ -1147,19 +1110,18 @@ export default function AurumTerminal() {
           <div style={{ fontSize: '12px', color: THEME.muted, marginTop: '2px' }}>
             Paper-trading terminal &middot; XAU/USD &middot; {dataSourceLabel}
           </div>
-          {replayTotalBars > 0 && (
+          {marketState && (
             <div
               style={{
                 fontSize: '11px',
                 fontFamily: FONT_MONO,
-                color: replayDone ? THEME.gain : THEME.muted,
+                color: marketOpen ? THEME.gain : THEME.muted,
                 marginTop: '4px',
               }}
             >
-              {replayDone
-                ? `Replay complete · ${replayBarsDone} of ${replayTotalBars} bars`
-                : `Bar ${replayBarsDone} / ${replayTotalBars}` +
-                  (currentBarDate ? ` · ${currentBarDate}` : '')}
+              {marketOpen
+                ? `Market open · ${priceHistory.length} bars today · last ${lastBarTime}`
+                : `Market ${(marketState || 'closed').toLowerCase()} — price is static until it reopens, so the bot will sit idle`}
             </div>
           )}
         </div>
@@ -1628,53 +1590,10 @@ export default function AurumTerminal() {
             fontSize: '13px',
             cursor: 'pointer',
           }}
-          title="Rewind the replay to the start of the selected period (keeps your portfolio)"
+          title="Re-seed the chart from the live feed (keeps your portfolio)"
         >
-          <RotateCcw size={14} /> Rewind replay
+          <RotateCcw size={14} /> Reload feed
         </button>
-        <select
-          value={replayYear}
-          onChange={(e) => handleReplayYearChange(e.target.value)}
-          aria-label="Select the period to replay"
-          title="Which stretch of real GC=F history to replay. Changing this rewinds and clears the portfolio."
-          style={{
-            background: THEME.panelAlt,
-            color: THEME.text,
-            border: `1px solid ${THEME.hairline}`,
-            borderRadius: '6px',
-            padding: '8px 12px',
-            fontFamily: FONT_MONO,
-            fontSize: '12px',
-          }}
-        >
-          <option value="all">All history</option>
-          {availableReplayYears.map((y) => (
-            <option key={y} value={String(y)}>
-              From {y}
-            </option>
-          ))}
-        </select>
-        <select
-          value={replaySpeed}
-          onChange={(e) => setReplaySpeed(e.target.value as ReplaySpeedKey)}
-          aria-label="Replay speed"
-          title="Playback speed only — trading rules are counted in bars, so results are identical at any speed."
-          style={{
-            background: THEME.panelAlt,
-            color: THEME.text,
-            border: `1px solid ${THEME.hairline}`,
-            borderRadius: '6px',
-            padding: '8px 12px',
-            fontFamily: FONT_MONO,
-            fontSize: '12px',
-          }}
-        >
-          {REPLAY_SPEEDS.map((s) => (
-            <option key={s.key} value={s.key}>
-              {s.label}
-            </option>
-          ))}
-        </select>
         <select
           value={riskKey}
           onChange={(e) => setRiskKey(e.target.value)}
@@ -1745,10 +1664,11 @@ export default function AurumTerminal() {
         >
           <AlertTriangle size={13} color={THEME.gold} style={{ flexShrink: 0, marginTop: '1px' }} />
           <span>
-            The news read below is <strong>displayed only</strong> and does not influence replay
-            trades. These are historical bars — scoring them with today&apos;s headlines would be
-            look-ahead bias, so the replay runs math-only, exactly like the Backtest tab. The
-            Always-On Bot is where live news actually drives decisions.
+            News is blended into the live score at {(NEWS_WEIGHT * 100).toFixed(0)}% weight,
+            decayed by age and by the model&apos;s own confidence. This is legitimate here because
+            the headlines and the price bar are contemporaneous — the Backtest tab stays math-only
+            for exactly that reason, since scoring a past bar with today&apos;s news would be
+            look-ahead bias.
           </span>
         </div>
       )}
@@ -1923,7 +1843,7 @@ export default function AurumTerminal() {
             height={280}
             timeframe={timeframe}
             onTimeframeChange={setTimeframe}
-            timeframes={DAILY_TIMEFRAMES}
+            timeframes={INTRADAY_TIMEFRAMES}
             entryPrice={portfolio.oz > 0 ? portfolio.entryPrice : null}
             slPrice={portfolio.oz > 0 ? portfolio.slPrice : null}
             tpPrice={portfolio.oz > 0 ? portfolio.tpPrice : null}

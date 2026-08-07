@@ -55,6 +55,15 @@ export const TIMEFRAMES: readonly TimeframeOption[] = [
   { key: '15m', label: '225', groupSize: 225 },
 ];
 
+// For feeds whose points are 1-minute bars (the live intraday feed).
+export const INTRADAY_TIMEFRAMES: readonly TimeframeOption[] = [
+  { key: '1m', label: '1m', groupSize: 1 },
+  { key: '5m', label: '5m', groupSize: 5 },
+  { key: '15m', label: '15m', groupSize: 15 },
+  { key: '1h', label: '1h', groupSize: 60 },
+  { key: '4h', label: '4h', groupSize: 240 },
+];
+
 // For feeds whose points are daily bars (the historical replay). Grouping is
 // expressed in trading days, so the labels mean what they say.
 export const DAILY_TIMEFRAMES: readonly TimeframeOption[] = [
