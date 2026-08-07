@@ -40,12 +40,24 @@ export async function POST(req: NextRequest) {
       await setState({ ...state, botRunning: false });
     } else if (input.action === 'reset') {
       const startCash = input.startCash ?? state.startCash;
+      // Clear the price buffer and the signal-timing state too, not just the
+      // portfolio. priceHistory is what every indicator (EMA12/26, RSI14,
+      // ATR14, the regression) is computed over, so a reset that leaves it
+      // behind produces a "fresh" bot that immediately trades on pre-reset
+      // observations — and if those came from a different price source, the
+      // seam between them reads as an enormous fake move. User configuration
+      // (risk preset, lot size, leverage, Kelly) is deliberately preserved.
       await setState({
         ...state,
         startCash,
         portfolio: freshPortfolio(startCash),
+        priceHistory: [],
         equityCurve: [],
+        price: null,
         consecutiveLosses: 0,
+        lastExitAt: null,
+        pendingEntrySince: null,
+        pendingExitSince: null,
         botRunning: false,
       });
     } else if (input.action === 'setRiskKey') {
