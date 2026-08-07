@@ -37,18 +37,28 @@ export async function GET() {
 
     // Yahoo emits null closes for minutes with no prints; drop them rather
     // than carrying holes into the indicator windows.
-    const points = timestamps
+    const all = timestamps
       .map((t, i) => ({ t, p: closes[i] }))
       .filter(
         (pt): pt is { t: number; p: number } =>
           typeof pt.t === 'number' && typeof pt.p === 'number' && !isNaN(pt.p)
       );
 
-    // Prefer the live quote, falling back to the most recent bar and then the
-    // previous close, so a request outside trading hours still returns a real
-    // number rather than nothing.
+    // Drop the final bar while the minute it covers is still forming. Yahoo
+    // includes the in-progress candle, whose close keeps moving until the
+    // minute ends — trading it would mean reacting to a half-built bar and
+    // then never seeing its corrected value, since the replacement arrives
+    // under the same timestamp the client has already consumed. Acting only
+    // on closed candles is the standard discipline here.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const points = all.filter((pt) => nowSec - pt.t >= 60);
+
+    // `price` is for display and may include the in-progress minute, so the
+    // header stays current even though the strategy only consumes closed
+    // bars. Falls back to the last bar and then the previous close so a
+    // request outside trading hours still returns a real number.
     const liveQuote = Number(meta?.regularMarketPrice);
-    const lastBar = points.length ? points[points.length - 1].p : null;
+    const lastBar = all.length ? all[all.length - 1].p : null;
     const prevClose = Number(meta?.chartPreviousClose ?? meta?.previousClose);
     const price =
       Number.isFinite(liveQuote) && liveQuote > 0
