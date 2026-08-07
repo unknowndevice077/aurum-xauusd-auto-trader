@@ -33,15 +33,37 @@ export async function GET() {
     const result = data?.chart?.result?.[0];
     const meta = result?.meta;
     const timestamps: number[] = result?.timestamp || [];
-    const closes: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
+    const quote = result?.indicators?.quote?.[0] ?? {};
+    const opens: (number | null)[] = quote.open || [];
+    const highs: (number | null)[] = quote.high || [];
+    const lows: (number | null)[] = quote.low || [];
+    const closes: (number | null)[] = quote.close || [];
 
-    // Yahoo emits null closes for minutes with no prints; drop them rather
-    // than carrying holes into the indicator windows.
+    // Full OHLC per bar, not just the close. Carrying only closes forces the
+    // chart to synthesise candles where open == high == low == close, which
+    // renders every bar as a flat dash with no body or wicks. The strategy
+    // still consumes `p` (the close); the extra fields exist purely so the
+    // chart can draw what actually happened inside each minute.
+    //
+    // Yahoo emits nulls for minutes with no prints; drop those rather than
+    // carrying holes into the indicator windows.
     const all = timestamps
-      .map((t, i) => ({ t, p: closes[i] }))
+      .map((t, i) => ({
+        t,
+        p: closes[i],
+        o: opens[i],
+        h: highs[i],
+        l: lows[i],
+        c: closes[i],
+      }))
       .filter(
-        (pt): pt is { t: number; p: number } =>
-          typeof pt.t === 'number' && typeof pt.p === 'number' && !isNaN(pt.p)
+        (b): b is { t: number; p: number; o: number; h: number; l: number; c: number } =>
+          typeof b.t === 'number' &&
+          typeof b.p === 'number' &&
+          !isNaN(b.p) &&
+          typeof b.o === 'number' &&
+          typeof b.h === 'number' &&
+          typeof b.l === 'number'
       );
 
     // Drop the final bar while the minute it covers is still forming. Yahoo

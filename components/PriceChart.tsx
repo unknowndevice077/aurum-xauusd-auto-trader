@@ -49,10 +49,10 @@ export type TimeframeKey = string;
 // spacing is its cron interval). groupSize is a count of raw points.
 export const TIMEFRAMES: readonly TimeframeOption[] = [
   { key: '1D', label: '1 tick', groupSize: 1 },
-  { key: '20s', label: '5', groupSize: 5 },
-  { key: '1m', label: '15', groupSize: 15 },
-  { key: '5m', label: '75', groupSize: 75 },
-  { key: '15m', label: '225', groupSize: 225 },
+  { key: '20s', label: '5 ticks', groupSize: 5 },
+  { key: '1m', label: '15 ticks', groupSize: 15 },
+  { key: '5m', label: '75 ticks', groupSize: 75 },
+  { key: '15m', label: '225 ticks', groupSize: 225 },
 ];
 
 // For feeds whose points are 1-minute bars (the live intraday feed).

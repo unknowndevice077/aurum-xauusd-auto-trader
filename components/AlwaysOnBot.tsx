@@ -36,11 +36,11 @@ export default function AlwaysOnBot() {
   const [startCashInput, setStartCashInput] = useState('10000');
   const [lotOzInput, setLotOzInput] = useState('0.05');
   const lotOzSynced = React.useRef(false);
-  // Server-tick spacing is whatever the external cron's interval is
-  // (typically 1-5 min), not the local sim's sub-second cadence, so '1D'
-  // (one candle per raw tick, no grouping) is the most honest default —
-  // the finest resolution actually available for this bot's own data.
-  const [timeframe, setTimeframe] = useState<TimeframeKey>('1D');
+  // This bot records a single price per cron tick, with no OHLC, so a candle
+  // built from one tick has open == high == low == close and draws as a flat
+  // dash. Grouping several ticks per candle gives it a real body and range.
+  // (The Local Simulation doesn't need this — its feed carries true OHLC.)
+  const [timeframe, setTimeframe] = useState<TimeframeKey>('20s');
 
   const refresh = useCallback(async () => {
     try {

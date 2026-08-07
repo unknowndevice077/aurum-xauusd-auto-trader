@@ -21,6 +21,45 @@ export function fmtOz(oz: number | null | undefined): string {
   return oz.toFixed(decimals);
 }
 
+// A bar carrying real OHLC from the data source.
+export type OhlcBar = { t: number; o: number; h: number; l: number; c: number };
+
+// Builds chart candles from bars that already carry true OHLC, so each candle
+// shows the actual range traded inside its period. Grouping aggregates the
+// honest way: open of the first bar, close of the last, and the extremes
+// across every bar in the group.
+//
+// buildCandles() below has to synthesise OHLC from a series of single prices,
+// which at groupSize 1 makes open == high == low == close and renders every
+// candle as a flat dash. Prefer this whenever the feed provides real OHLC.
+export function buildCandlesFromBars(bars: OhlcBar[], groupSize: number): Candle[] {
+  const valid = bars.filter(
+    (b) =>
+      b &&
+      [b.t, b.o, b.h, b.l, b.c].every((v) => typeof v === 'number' && !isNaN(v))
+  );
+  const closes = valid.map((b) => b.c);
+  const sma20s = smaSeriesFull(closes, 20);
+  const sma50s = smaSeriesFull(closes, 50);
+
+  const candles: Candle[] = [];
+  for (let i = 0; i < valid.length; i += groupSize) {
+    const chunk = valid.slice(i, i + groupSize);
+    if (chunk.length === 0) continue;
+    const endIdx = Math.min(i + groupSize, valid.length) - 1;
+    candles.push({
+      time: chunk[0].t,
+      o: chunk[0].o,
+      h: Math.max(...chunk.map((b) => b.h)),
+      l: Math.min(...chunk.map((b) => b.l)),
+      c: chunk[chunk.length - 1].c,
+      sma20: sma20s[endIdx],
+      sma50: sma50s[endIdx],
+    });
+  }
+  return candles;
+}
+
 export function buildCandles(rawPoints: { t: number; p: number }[], groupSize: number): Candle[] {
   const points = rawPoints.filter(
     (pt) =>

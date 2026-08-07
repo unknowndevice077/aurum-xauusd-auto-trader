@@ -56,9 +56,10 @@ import type { Portfolio, Trade, NewsResult, ProviderKey, ProviderMeta } from '..
 import {
   fmtUSD,
   fmtOz,
-  buildCandles,
+  buildCandlesFromBars,
   backfillTradePnl,
   fetchNewsAnalysis,
+  type OhlcBar,
 } from '../lib/helpers';
 import { THEME } from '../lib/theme';
 
@@ -173,6 +174,11 @@ export default function AurumTerminal() {
   const [marketState, setMarketState] = useState<string | null>(null);
   // Bumped to force a re-seed of the live bar buffer from /api/live.
   const [reseedNonce, setReseedNonce] = useState(0);
+  // Real OHLC straight from the feed, kept alongside priceHistory (which is
+  // closes only, for the indicators). The chart draws from this so candles
+  // show the range actually traded inside each minute instead of collapsing
+  // to a flat dash.
+  const [ohlcBars, setOhlcBars] = useState<OhlcBar[]>([]);
   const [providerKey, setProviderKey] = useState<ProviderKey>('openai');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(PROVIDER_META.openai.defaultModel);
@@ -374,14 +380,15 @@ export default function AurumTerminal() {
           setDataSourceLabel(`Live gold feed unavailable: ${json.error ?? 'no data'}`);
           return;
         }
-        const points: { t: number; p: number }[] = json.points;
+        const points: (OhlcBar & { p: number })[] = json.points;
         barIndexRef.current = 0;
         lastExitBarRef.current = null;
         pendingEntryBarRef.current = null;
         pendingExitBarRef.current = null;
         entryBarRef.current = null;
-        historyRef.current = points;
-        setPriceHistory(points);
+        historyRef.current = points.map((b) => ({ t: b.t, p: b.p }));
+        setPriceHistory(historyRef.current);
+        setOhlcBars(points.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c })));
         const last = json.price ?? points[points.length - 1].p;
         priceRef.current = last;
         setPrice(last);
@@ -435,7 +442,7 @@ export default function AurumTerminal() {
     const id = setInterval(async () => {
       let json: {
         price?: number;
-        points?: { t: number; p: number }[];
+        points?: (OhlcBar & { p: number })[];
         marketState?: string;
         error?: string;
       };
@@ -487,11 +494,15 @@ export default function AurumTerminal() {
       priceRef.current = nextPrice;
       setPrice(nextPrice);
 
-      const nextHistory = [...historyRef.current, { t: nowSec, p: nextPrice }].slice(
-        -HISTORY_CAP
-      );
-      historyRef.current = nextHistory;
-      setPriceHistory(nextHistory);
+      // Adopt the feed's series wholesale rather than appending one bar to a
+      // locally accumulated buffer. The feed is authoritative, so this stays
+      // exactly in sync with it and self-heals after a dropped poll or a
+      // network gap, instead of quietly carrying a hole forever.
+      const feedBars = json.points.slice(-HISTORY_CAP);
+      historyRef.current = feedBars.map((b) => ({ t: b.t, p: b.p }));
+      setPriceHistory(historyRef.current);
+      setOhlcBars(feedBars.map((b) => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c })));
+      const nextHistory = historyRef.current;
 
       const rawPrices = nextHistory.map((pt) => pt.p);
       const indicators = computeIndicators(rawPrices);
@@ -1074,8 +1085,8 @@ export default function AurumTerminal() {
   const activeGroupSize =
     INTRADAY_TIMEFRAMES.find((t) => t.key === timeframe)?.groupSize ?? 1;
   const candles = useMemo(
-    () => buildCandles(priceHistory, activeGroupSize),
-    [priceHistory, activeGroupSize]
+    () => buildCandlesFromBars(ohlcBars, activeGroupSize),
+    [ohlcBars, activeGroupSize]
   );
   const activeProvider = PROVIDER_META[providerKey];
   const openPositionPnlPct =
