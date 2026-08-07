@@ -42,14 +42,28 @@ function buildTradeMarkers(trades: TradeMarker[]): SeriesMarker<Time>[] {
     }));
 }
 
-export const TIMEFRAMES = [
+export type TimeframeOption = { key: string; label: string; groupSize: number };
+export type TimeframeKey = string;
+
+// For feeds whose points are individual ticks (the always-on bot, whose tick
+// spacing is its cron interval). groupSize is a count of raw points.
+export const TIMEFRAMES: readonly TimeframeOption[] = [
+  { key: '1D', label: '1 tick', groupSize: 1 },
+  { key: '20s', label: '5', groupSize: 5 },
+  { key: '1m', label: '15', groupSize: 15 },
+  { key: '5m', label: '75', groupSize: 75 },
+  { key: '15m', label: '225', groupSize: 225 },
+];
+
+// For feeds whose points are daily bars (the historical replay). Grouping is
+// expressed in trading days, so the labels mean what they say.
+export const DAILY_TIMEFRAMES: readonly TimeframeOption[] = [
   { key: '1D', label: '1D', groupSize: 1 },
-  { key: '20s', label: '20s', groupSize: 5 },
-  { key: '1m', label: '1m', groupSize: 15 },
-  { key: '5m', label: '5m', groupSize: 75 },
-  { key: '15m', label: '15m', groupSize: 225 },
-] as const;
-export type TimeframeKey = (typeof TIMEFRAMES)[number]['key'];
+  { key: '1W', label: '1W', groupSize: 5 },
+  { key: '1M', label: '1M', groupSize: 21 },
+  { key: '3M', label: '3M', groupSize: 63 },
+  { key: '1Y', label: '1Y', groupSize: 252 },
+];
 
 export default function PriceChart({
   candles,
@@ -61,6 +75,7 @@ export default function PriceChart({
   tpPrice,
   beActive,
   trades = [],
+  timeframes = TIMEFRAMES,
 }: {
   candles: Candle[];
   height?: number;
@@ -71,6 +86,7 @@ export default function PriceChart({
   tpPrice?: number | null;
   beActive?: boolean;
   trades?: TradeMarker[];
+  timeframes?: readonly TimeframeOption[];
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -251,7 +267,7 @@ export default function PriceChart({
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
         <div style={{ display: 'flex', gap: 4 }}>
-          {TIMEFRAMES.map((tf) => (
+          {timeframes.map((tf) => (
             <button
               key={tf.key}
               onClick={() => onTimeframeChange(tf.key)}
